@@ -10,6 +10,7 @@ from flask import Flask, request
 import api_common
 
 app = Flask(__name__)
+api_common.json_errors(app)
 
 
 @app.route("/", methods=["POST"])
