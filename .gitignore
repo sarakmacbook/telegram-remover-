@@ -1,0 +1,13 @@
+# credentials — NEVER commit these
+.env
+
+# logged-in Telegram session — NEVER commit this, it is your account
+*.session
+*.session-journal
+
+# python
+__pycache__/
+.venv/
+
+# vercel
+.vercel

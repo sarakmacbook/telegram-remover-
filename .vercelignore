@@ -1,0 +1,9 @@
+# keep the deployment small — none of this is needed at runtime
+.venv
+.env
+*.session
+*.session-journal
+__pycache__
+.git
+.vercel
+node_modules
