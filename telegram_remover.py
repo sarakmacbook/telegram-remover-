@@ -15,6 +15,9 @@ uses a user session, exactly like Telegram Desktop does.
 
 SAFETY: every destructive command is a DRY RUN unless you pass --yes.
 Nothing is deleted until you say so.
+
+The heavy lifting lives in remover_core.py, which is shared with the
+Vercel web app (api/*.py + index.html).
 """
 
 import argparse
@@ -23,12 +26,14 @@ import os
 import sys
 from pathlib import Path
 
-from telethon import TelegramClient, errors, types
-from telethon.tl.functions.account import DeleteAccountRequest
-from telethon.tl.functions.channels import LeaveChannelRequest
-from telethon.tl.functions.messages import DeleteChatUserRequest
+from telethon import TelegramClient, types
 
-BATCH = 100  # Telegram allows deleting up to 100 messages per call
+import remover_core as core
+# re-exported for the test-suite (and anyone importing this module)
+from remover_core import (BATCH, FloodWait, classify, delete_account,  # noqa: F401
+                          delete_ids, resolve_entity, rpc, sweep_chunk)
+
+CHUNK = 200  # messages per sweep chunk (the CLI loops chunks until done)
 
 
 # --------------------------------------------------------------------------
@@ -53,16 +58,6 @@ def load_config():
     return int(api_id), api_hash, os.getenv("PHONE")
 
 
-async def rpc(call, what="request"):
-    """Run an RPC, transparently sleeping through Telegram's flood limits."""
-    while True:
-        try:
-            return await call()
-        except errors.FloodWaitError as e:
-            print(f"    flood-limited, sleeping {e.seconds}s ...", flush=True)
-            await asyncio.sleep(e.seconds + 1)
-
-
 async def connect(args, need_auth=True):
     """Connect the client; abort with a friendly message if not logged in."""
     api_id, api_hash, phone = load_config()
@@ -74,88 +69,34 @@ async def connect(args, need_auth=True):
     return client, phone
 
 
-async def resolve_chat(client, query):
-    """Accept @username, numeric id, phone number, or an exact chat title."""
-    try:
-        return await client.get_entity(query)
-    except (ValueError, TypeError):
-        pass
-    q = query.lower()
-    async for d in client.iter_dialogs():
-        if (d.title or "").lower() == q:
-            return d.entity
-    sys.exit(f"ERROR: could not find a chat matching {query!r}")
-
-
-def classify(entity):
-    """Human-readable kind of a chat entity."""
-    if isinstance(entity, types.User):
-        return "private"
-    if isinstance(entity, types.Channel) and entity.megagroup:
-        return "supergroup"
-    if isinstance(entity, types.Channel):
-        return "channel"
-    if isinstance(entity, types.Chat):
-        return "group"
-    return "unknown"
-
-
 # --------------------------------------------------------------------------
-# deletion helpers
+# sweeping (chunked, shared with the web app)
 # --------------------------------------------------------------------------
-
-async def delete_ids(client, entity, ids, revoke=True):
-    """Delete a batch of message ids. Returns how many FAILED."""
-    if not ids:
-        return 0
-    try:
-        await rpc(lambda: client.delete_messages(entity, ids, revoke=revoke))
-        return 0
-    except errors.ChatAdminRequiredError:
-        # Not allowed to delete for everyone here (not admin / channel):
-        # fall back to deleting for ourselves only.
-        if revoke:
-            return await delete_ids(client, entity, ids, revoke=False)
-        return len(ids)
-    except errors.RPCError as e:
-        print(f"    could not delete {len(ids)} message(s): {e}", flush=True)
-        return len(ids)
-
 
 async def _sweep(client, entity, label, yes, from_user=None, limit=None):
-    """Iterate a chat and delete messages in batches of BATCH.
+    """Delete (or, in dry-run, count) messages in chunks until the chat is done.
 
-    If from_user is given, only that user's messages are removed.
     Returns (processed, failed).
     """
     processed = failed = 0
-    ids = []
-
-    async def flush():
-        nonlocal ids, failed
-        if ids:
-            if yes:
-                failed += await delete_ids(client, entity, ids)
-            ids = []
-
-    async for msg in client.iter_messages(entity, from_user=from_user,
-                                         limit=limit):
-        ids.append(msg.id)
-        if len(ids) >= BATCH:
-            processed += len(ids)
-            await flush()
+    cursor = 0
+    while True:
+        remaining = None if limit is None else limit - processed
+        if remaining is not None and remaining <= 0:
+            break
+        chunk = CHUNK if remaining is None else min(CHUNK, remaining)
+        res = await sweep_chunk(client, entity, chunk, cursor,
+                                from_user=from_user, yes=yes)
+        processed += res["processed"]
+        failed += res["failed"]
+        if processed:
             print(f"\r  {label}: {processed} so far ...", end="", flush=True)
-    if ids:
-        processed += len(ids)
-        await flush()
+        if res["done"] or res["processed"] == 0:
+            break
+        cursor = res["next_cursor"]
     if processed:
         print(f"\r  {label}: {processed} so far ...")
     return processed, failed
-
-
-async def wipe_entity(client, entity, label, yes):
-    """Delete ALL messages in a chat (both sides where Telegram permits)."""
-    return await _sweep(client, entity, label, yes, from_user=None)
 
 
 # --------------------------------------------------------------------------
@@ -197,7 +138,7 @@ async def cmd_clean_messages(args):
     me = await client.get_me()
 
     if args.chat:
-        targets = [(args.chat, await resolve_chat(client, args.chat))]
+        targets = [(args.chat, await resolve_entity(client, args.chat))]
     else:
         targets = [(d.title, d) async for d in client.iter_dialogs()]
 
@@ -210,9 +151,8 @@ async def cmd_clean_messages(args):
 
     total = total_failed = 0
     for title, entity in targets:
-        kwargs = {} if not args.limit else {"limit": args.limit}
         processed, failed = await _sweep(client, entity, title, args.yes,
-                                         from_user=me, **kwargs)
+                                         from_user=me, limit=args.limit or None)
         if processed or failed:
             verb = "deleted" if args.yes else "would delete"
             line = f"  {title}: {verb} {processed} message(s)"
@@ -233,13 +173,13 @@ async def cmd_clean_messages(args):
 async def cmd_wipe(args):
     """Wipe the FULL history of one chat (both sides where permitted)."""
     client, _ = await connect(args)
-    entity = await resolve_chat(client, args.chat)
+    entity = await resolve_entity(client, args.chat)
     label = getattr(entity, "title", None) or getattr(entity, "first_name", None) \
         or args.chat
 
     mode = "WIPING" if args.yes else "DRY RUN — nothing will be deleted"
     print(f"{mode}: full history of '{label}'")
-    processed, failed = await wipe_entity(client, entity, label, args.yes)
+    processed, failed = await _sweep(client, entity, label, args.yes)
     verb = "Wiped" if args.yes else "Would wipe"
     print(f"{verb} {processed} message(s)"
           + (f", {failed} failed" if failed else ""))
@@ -257,54 +197,43 @@ async def cmd_leave_all(args):
 
     keep = set()
     for k in args.keep:
-        keep.add((await resolve_chat(client, k)).id)
+        keep.add((await resolve_entity(client, k)).id)
 
     mode = "LEAVING" if args.yes else "DRY RUN — nothing will be left"
     print(f"{mode}: all groups/channels"
           + (f" (keeping {len(keep)})" if keep else ""))
     if args.include_private:
-        print("Private chats will be wiped (history deleted for both sides).")
-    print()
+        print("Private chats will be wiped (history deleted for both sides).\n")
+    else:
+        print()
 
-    left = kept = failed = wiped = 0
-    async for d in client.iter_dialogs():
-        ent = d.entity
-        if ent is None:
-            continue
-        kind = classify(ent)
-
-        if kind == "private":
-            if not args.include_private or ent.id == me.id:  # skip Saved Messages
+    wiped = 0
+    if args.include_private:
+        async for d in client.iter_dialogs():
+            ent = d.entity
+            if ent is None or ent.id == me.id:  # skip Saved Messages
                 continue
-            processed, _ = await wipe_entity(client, ent, d.title, args.yes)
-            wiped += processed
-            continue
+            if classify(ent) == "private":
+                processed, _ = await _sweep(client, ent, d.title, args.yes)
+                wiped += processed
 
-        if kind not in ("group", "supergroup", "channel"):
-            continue
-        if ent.id in keep:
-            kept += 1
-            continue
-
-        if isinstance(ent, types.Chat):  # small/basic group
-            request = DeleteChatUserRequest(ent.id, me)
-        else:  # channel or megagroup
-            request = LeaveChannelRequest(ent)
-
-        if args.yes:
-            try:
-                await rpc(lambda: client(request))
-                left += 1
-                print(f"  left {d.title}", flush=True)
-            except errors.RPCError as e:
-                failed += 1
-                print(f"  FAILED to leave {d.title}: {e}", flush=True)
-        else:
-            left += 1
-            print(f"  would leave {d.title}", flush=True)
+    left = failed = 0
+    while True:
+        res = await core.leave_chats(client, keep, limit=50, yes=args.yes,
+                                     me=me)
+        left += res["left"]
+        failed += res["failed"]
+        verb = "left" if args.yes else "would leave"
+        print(f"  {verb} {res['left']} in this pass ({left} total) ...",
+              flush=True)
+        if res["done"]:
+            break
+        if res["left"] == 0:
+            print("  no progress (every remaining chat failed) — stopping.")
+            break
 
     verb = "Left" if args.yes else "Would leave"
-    print(f"\n{verb} {left} group(s)/channel(s), kept {kept}, {failed} failed")
+    print(f"\n{verb} {left} group(s)/channel(s), {failed} failed")
     if wiped:
         print(f"{'Wiped' if args.yes else 'Would wipe'} {wiped} message(s) "
               f"in private chats")
@@ -331,11 +260,11 @@ async def cmd_delete_account(args):
         print("Aborted. Nothing was deleted.")
         await client.disconnect()
         return
-    await rpc(lambda: client(DeleteAccountRequest(reason=args.reason)))
+    await core.delete_account(client, args.reason)
     print("Account deleted. The session is now invalid.")
     try:
         await client.disconnect()
-    except errors.RPCError:
+    except Exception:
         pass
     # Remove the local session file — it is useless now and sensitive.
     for suffix in (".session", ".session-journal"):

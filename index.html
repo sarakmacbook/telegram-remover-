@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>telegram-remover</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #0f1420; color: #e6e9f0; margin: 0; padding: 24px; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; } h1 span { color: #5aa2ff; }
+  h2 { font-size: 1.05rem; margin: 0 0 6px; }
+  .card { background: #1a2233; border: 1px solid #2a3550; border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+  .warn { background: #3a2a12; border: 1px solid #8a6a1f; }
+  label { display: block; font-size: .8rem; color: #9aa7c4; margin: 8px 0 3px; }
+  input { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #33415e; background: #0f1420; color: #e6e9f0; }
+  button { padding: 8px 14px; border-radius: 6px; border: 0; background: #2f6fed; color: #fff; cursor: pointer; margin: 4px 6px 4px 0; }
+  button:hover { background: #3f7ff5; }
+  button.danger { background: #b3372f; }
+  button.danger:hover { background: #c9453d; }
+  button.ghost { background: #33415e; }
+  button.ghost:hover { background: #3f4f73; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .chat { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid #232d45; }
+  .chat .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kind { font-size: .68rem; padding: 2px 7px; border-radius: 20px; background: #2a3550; color: #9aa7c4; text-transform: uppercase; }
+  #log { background: #0b0f18; border: 1px solid #232d45; border-radius: 8px; padding: 10px; height: 180px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: .78rem; white-space: pre-wrap; }
+  .err { color: #ff7b72; } .ok { color: #7ee787; } .dim { color: #9aa7c4; }
+  .hidden { display: none; }
+  a { color: #5aa2ff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>telegram<span>-remover</span></h1>
+  <div class="card warn">⚠️ This tool acts on <b>your own</b> Telegram account and
+  everything it does is <b>irreversible</b>. Your session is stored in
+  <b>this browser only</b> (localStorage) — nothing is kept on the server.
+  Only use a deployment you trust.</div>
+
+  <div class="card" id="loginCard">
+    <h2>Connect</h2>
+    <label>API ID (from <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a>)</label>
+    <input id="apiId" inputmode="numeric" placeholder="123456">
+    <label>API HASH</label>
+    <input id="apiHash" placeholder="0123456789abcdef0123456789abcdef">
+    <label>Phone number (with country code)</label>
+    <input id="phone" placeholder="+855...">
+    <label>Access token (only if you set ACCESS_TOKEN on the server)</label>
+    <input id="accessToken" type="password">
+    <div class="row" style="margin-top:10px">
+      <button onclick="sendCode()">Send login code</button>
+    </div>
+    <div id="codeBox" class="hidden">
+      <label>Code from Telegram</label>
+      <input id="code" inputmode="numeric" placeholder="12345">
+      <label>2FA password (only if you have one)</label>
+      <input id="password" type="password">
+      <div class="row" style="margin-top:10px">
+        <button onclick="signIn()">Sign in</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="main" class="hidden">
+    <div class="card">
+      <div class="row">
+        <h2 style="flex:1">Your chats <span id="me" class="dim"></span></h2>
+        <button class="ghost" onclick="loadChats()">Refresh</button>
+        <button class="ghost" onclick="logout()">Log out</button>
+      </div>
+      <label>Keep these when leaving everything (comma-separated @usernames/ids)</label>
+      <input id="keep" placeholder="@bestfriend, 123456789">
+      <div class="row" style="margin-top:10px">
+        <button class="danger" onclick="leaveAll()">Leave ALL groups/channels</button>
+        <button class="danger" onclick="deleteAccount()">Delete my account</button>
+      </div>
+      <div id="chats" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = (k, v) => (v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v));
+const S = {
+  apiId: localStorage.getItem("tg_api_id") || "",
+  apiHash: localStorage.getItem("tg_api_hash") || "",
+  accessToken: localStorage.getItem("tg_access_token") || "",
+  session: localStorage.getItem("tg_session") || "",
+  phoneCodeHash: "",
+};
+$("apiId").value = S.apiId;
+$("apiHash").value = S.apiHash;
+$("accessToken").value = S.accessToken;
+
+function log(msg, cls) {
+  const el = $("log");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const creds = () => ({ api_id: S.apiId, api_hash: S.apiHash });
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body == null ? "GET" : "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Tg-Session": S.session,
+      "X-Access-Token": S.accessToken,
+    },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* non-JSON response */ }
+  return { status: res.status, data };
+}
+
+async function sendCode() {
+  S.apiId = $("apiId").value.trim();
+  S.apiHash = $("apiHash").value.trim();
+  S.accessToken = $("accessToken").value.trim();
+  store("tg_api_id", S.apiId);
+  store("tg_api_hash", S.apiHash);
+  store("tg_access_token", S.accessToken);
+  const phone = $("phone").value.trim();
+  if (!S.apiId || !S.apiHash || !phone) {
+    return log("Fill in API ID, API hash and phone number.", "err");
+  }
+  log("Sending login code...");
+  const { data } = await api("/api/auth_start", { ...creds(), phone });
+  if (data.phone_code_hash) {
+    S.phoneCodeHash = data.phone_code_hash;
+    $("codeBox").classList.remove("hidden");
+    log("Code sent — check your Telegram app.", "ok");
+  } else {
+    log("Error: " + (data.error || "unknown"), "err");
+  }
+}
+
+async function signIn() {
+  const phone = $("phone").value.trim();
+  const body = { ...creds(), phone, code: $("code").value.trim(), phone_code_hash: S.phoneCodeHash };
+  const pw = $("password").value;
+  if (pw) body.password = pw;
+  const { data } = await api("/api/auth_finish", body);
+  if (data.need_password) {
+    return log("Two-factor auth is on — enter your cloud password and click Sign in again.", "dim");
+  }
+  if (data.session) {
+    S.session = data.session;
+    store("tg_session", S.session);
+    log("Logged in as " + ((data.me && data.me.name) || "id " + (data.me && data.me.id)) + " ✔", "ok");
+    $("loginCard").classList.add("hidden");
+    $("main").classList.remove("hidden");
+    if (data.me && data.me.username) $("me").textContent = "@" + data.me.username;
+    loadChats();
+  } else {
+    log("Error: " + (data.error || "unknown"), "err");
+  }
+}
+
+function logout() {
+  store("tg_session", null);
+  S.session = "";
+  $("main").classList.add("hidden");
+  $("loginCard").classList.remove("hidden");
+  log("Logged out (session removed from this browser).");
+}
+
+async function loadChats() {
+  const { status, data } = await api("/api/dialogs?" + new URLSearchParams(creds()));
+  if (status !== 200) return log("Could not load chats: " + (data.error || status), "err");
+  const box = $("chats");
+  box.innerHTML = "";
+  for (const c of data.dialogs) {
+    const row = document.createElement("div");
+    row.className = "chat";
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = c.kind;
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = c.title || ("id " + c.id);
+    const b1 = document.createElement("button");
+    b1.className = "ghost";
+    b1.textContent = "My messages";
+    b1.onclick = () => cleanChat(c);
+    const b2 = document.createElement("button");
+    b2.className = "danger";
+    b2.textContent = "Wipe";
+    b2.onclick = () => wipeChat(c);
+    row.appendChild(kind); row.appendChild(title); row.appendChild(b1); row.appendChild(b2);
+    box.appendChild(row);
+  }
+  log("Loaded " + data.dialogs.length + " chats.");
+}
+
+// Poll a chunked endpoint until it reports done. Handles flood waits.
+async function runChunked(path, body, label) {
+  let cursor = 0, total = 0, failed = 0;
+  for (;;) {
+    const { status, data } = await api(path, { ...body, ...creds(), cursor });
+    if (data.flood_wait) {
+      log(label + ": Telegram says wait " + data.flood_wait + "s ...", "dim");
+      await sleep(data.flood_wait * 1000 + 500);
+      continue;
+    }
+    if (status !== 200) {
+      log(label + ": ERROR — " + (data.error || status), "err");
+      return;
+    }
+    total += data.deleted || 0;
+    failed += data.failed || 0;
+    log(label + ": " + total + " deleted" + (failed ? ", " + failed + " failed" : ""));
+    if (data.done || !data.next_cursor) {
+      log(label + ": done ✔", "ok");
+      return;
+    }
+    cursor = data.next_cursor;
+  }
+}
+
+async function cleanChat(c) {
+  if (!confirm('Delete ALL messages sent by YOU in "' + c.title + '"?')) return;
+  await runChunked("/api/clean", { chat: String(c.id), limit: 200 }, 'clean "' + c.title + '"');
+}
+
+async function wipeChat(c) {
+  if (!confirm('WIPE THE ENTIRE HISTORY of "' + c.title + '"? Both sides where permitted.')) return;
+  await runChunked("/api/wipe", { chat: String(c.id), limit: 200 }, 'wipe "' + c.title + '"');
+}
+
+async function leaveAll() {
+  const keep = $("keep").value.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!confirm("Leave ALL groups and channels? (the keep-list is respected)")) return;
+  let total = 0;
+  for (;;) {
+    const { status, data } = await api("/api/leave", { ...creds(), keep, limit: 10 });
+    if (data.flood_wait) {
+      log("leave-all: Telegram says wait " + data.flood_wait + "s ...", "dim");
+      await sleep(data.flood_wait * 1000 + 500);
+      continue;
+    }
+    if (status !== 200) {
+      log("leave-all: ERROR — " + (data.error || status), "err");
+      return;
+    }
+    total += data.left || 0;
+    log("leave-all: " + total + " left so far");
+    if (data.done) {
+      log("leave-all: done — left " + total + " chats ✔", "ok");
+      break;
+    }
+  }
+  loadChats();
+}
+
+async function deleteAccount() {
+  const typed = prompt("This PERMANENTLY deletes your Telegram account.\nType DELETE to confirm:");
+  if (typed !== "DELETE") return log("Aborted.", "dim");
+  const { data } = await api("/api/delete_account", { ...creds(), reason: "Deleted via telegram-remover web UI" });
+  if (data.deleted) {
+    log("Account deleted. ✔", "ok");
+    logout();
+  } else {
+    log("Error: " + (data.error || "unknown"), "err");
+  }
+}
+
+if (S.session) {
+  $("loginCard").classList.add("hidden");
+  $("main").classList.remove("hidden");
+  loadChats();
+}
+</script>
+</body>
+</html>

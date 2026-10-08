@@ -1,6 +1,6 @@
-"""Unit tests for telegram_remover — no real Telegram account needed.
+"""Unit tests for the telegram-remover CLI — no real Telegram account needed.
 
-Run with:  python -m unittest test_telegram_remover -v
+Run with:  python -m unittest discover -v
 """
 
 import unittest
@@ -24,15 +24,21 @@ class FakeMessage:
 
 
 class FakeClient:
-    """Minimal stand-in for TelegramClient used by the sweep/delete helpers."""
+    """Minimal stand-in for TelegramClient used by the sweep/delete helpers.
+
+    Mimics Telegram's newest-first iteration and actually removes deleted
+    messages, so chunked sweeps terminate.
+    """
 
     def __init__(self, message_ids, fail_with=None):
-        self.message_ids = message_ids
+        self.message_ids = list(message_ids)
         self.fail_with = fail_with
         self.deleted_batches = []  # list of (ids, revoke)
 
-    def iter_messages(self, entity, from_user=None, limit=None):
-        ids = self.message_ids
+    def iter_messages(self, entity, from_user=None, limit=None, offset_id=0):
+        ids = sorted(self.message_ids, reverse=True)  # newest first, like Telegram
+        if offset_id:
+            ids = [i for i in ids if i < offset_id]
         if from_user is not None:
             ids = [i for i in ids if i % 2 == 0]  # pretend only even ids are "mine"
         if limit:
@@ -48,6 +54,7 @@ class FakeClient:
         if self.fail_with is not None:
             raise self.fail_with
         self.deleted_batches.append((list(ids), revoke))
+        self.message_ids = [i for i in self.message_ids if i not in ids]
         return None
 
 
@@ -95,6 +102,7 @@ class TestDeleteIds(unittest.IsolatedAsyncioTestCase):
                 if revoke:
                     raise errors.ChatAdminRequiredError(request=None)
                 self.deleted_batches.append((list(ids), revoke))
+                self.message_ids = [i for i in self.message_ids if i not in ids]
 
         client = FlakyClient([])
         failed = await tr.delete_ids(client, "chat", [7, 8], revoke=True)
