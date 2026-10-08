@@ -12,6 +12,7 @@ Handlers return plain dicts / (dict, status) tuples; Flask jsonifies them.
 """
 
 import asyncio
+import importlib
 import os
 import re
 
@@ -20,15 +21,45 @@ from werkzeug.exceptions import HTTPException
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
-import db
-import guard_core
-import notify
-import remover_core
+
+def _optional_import(name):
+    """Import a sibling module, or return ``(None, why)`` instead of raising.
+
+    The heavy siblings need third-party packages and travel in the serverless
+    bundle through ``vercel.json``'s ``includeFiles``. If one of them is
+    missing on a deployment, the app must still answer with a JSON explanation
+    — a platform HTML 500 leaves the web UI reporting nothing useful.
+    """
+    try:
+        return importlib.import_module(name), None
+    except Exception as e:      # noqa: BLE001 - never let one module kill the app
+        return None, f"{name}.py ({type(e).__name__}: {e})"
+
+
+notify, NOTIFY_ERROR = _optional_import("notify")   # stdlib-only, needed by all
+db, DB_ERROR = _optional_import("db")
+guard_core, GUARD_ERROR = _optional_import("guard_core")
+remover_core, REMOVER_ERROR = _optional_import("remover_core")
+
+# An empty tuple never matches, so a missing remover_core cannot break _exec.
+FLOOD_WAIT_ERRORS = (remover_core.FloodWait,) if remover_core is not None else ()
 
 DEFAULT_CHUNK = 200   # messages per /api/clean and /api/wipe call
 MAX_CHUNK = 1000
 DEFAULT_LEAVE = 10    # chats per /api/leave call
 MAX_LEAVE = 100
+
+
+def missing_module(error):
+    """A JSON 500 explaining that the deployment did not ship a module."""
+    return {
+        "error": f"this deployment could not load {error}. Its serverless "
+                 "bundle is incomplete — redeploy the whole repository so "
+                 "vercel.json's includeFiles ships api_common.py, notify.py, "
+                 "db.py, guard_core.py and remover_core.py.",
+        "http_status": 500,
+    }, 500
+
 
 # Anything shaped like a Bot API token, so error text can never leak one.
 SECRET_RE = re.compile(r"[0-9]{5,}:[A-Za-z0-9_-]{10,}")
@@ -64,14 +95,35 @@ def json_errors(app):
 
 def _store():
     """The SQL store (set DATABASE_URL to enable), or None. Never raises."""
+    if db is None:
+        return None
     try:
         return db.get_store()
     except Exception:  # noqa: BLE001 — storage must never break an API call
         return None
 
 
+class _NullNotifier:
+    """Stands in for ``notify.Notifier`` when the module is missing."""
+
+    token = ""
+    chat_id = ""
+    enabled = False
+
+    def send(self, text=None):
+        return False
+
+    def send_guard(self, record=None):
+        return False
+
+    def send_run(self, action, summary=""):
+        return False
+
+
 def _notifier(headers=None):
     """Use browser-provided bot settings for this request, else server env."""
+    if notify is None:
+        return _NullNotifier()
     try:
         if headers is not None:
             token = (headers.get("X-Tg-Bot-Token") or "").strip()
@@ -80,13 +132,13 @@ def _notifier(headers=None):
                 # A partial/invalid browser config must not fall through to a
                 # different bot configured for the deployment.
                 if not notify.valid_bot_token(token) or not chat_id:
-                    return notify.Notifier("", "")
+                    return _NullNotifier()
                 enabled = (os.environ.get("TELEGRAM_NOTIFY") or "1").strip().lower() \
                     not in notify.FALSEY
                 return notify.Notifier(token, chat_id, enabled=enabled)
         return notify.Notifier.from_env()
     except Exception:  # noqa: BLE001
-        return notify.Notifier("", "")
+        return _NullNotifier()
 
 
 def _record_run(action, summary, status="done", chat=None, details=None,
@@ -164,9 +216,11 @@ def _exec(session, api_id, api_hash, work):
         finally:
             await client.disconnect()
 
+    if remover_core is None:
+        return missing_module(REMOVER_ERROR)
     try:
         return asyncio.run(runner())
-    except remover_core.FloodWait as e:
+    except FLOOD_WAIT_ERRORS as e:
         return {"flood_wait": e.seconds}, 429
     except PermissionError as e:
         return {"error": str(e)}, 401
@@ -191,6 +245,8 @@ def _chunk_params(data):
 
 def _api_base_info():
     """The configured Bot API root, or None when TELEGRAM_API_BASE is broken."""
+    if notify is None:
+        return None
     try:
         return notify.api_base()
     except notify.BotAPIError:
@@ -214,6 +270,8 @@ def handle_bot_connect(data):
     Every failure names what went wrong (bad token shape, unreachable Bot API
     host, chat the bot cannot post to) so the UI never has to guess.
     """
+    if notify is None:
+        return missing_module(NOTIFY_ERROR)
     if not isinstance(data, dict):
         return {"error": "the request body must be a JSON object with "
                          "bot_token and chat_id"}, 400
@@ -277,6 +335,8 @@ def handle_bot_diagnostics():
     use, whether this server can reach it at all, and what else would make a
     connect attempt fail. Tokens are never returned, only their presence.
     """
+    if notify is None:
+        return missing_module(NOTIFY_ERROR)
     env = os.environ
     base = _api_base_info()
     reachable, detail = notify.probe_api_base(base, timeout=5)
@@ -421,6 +481,8 @@ def handle_clean(data, headers):
     api_id, api_hash, err = api_creds(data)
     if err:
         return err
+    if remover_core is None:
+        return missing_module(REMOVER_ERROR)
     chat = str(data.get("chat") or "").strip()
     if not chat:
         return {"error": "chat is required (@username, id, or exact title)"}, 400
@@ -455,6 +517,8 @@ def handle_wipe(data, headers):
     api_id, api_hash, err = api_creds(data)
     if err:
         return err
+    if remover_core is None:
+        return missing_module(REMOVER_ERROR)
     chat = str(data.get("chat") or "").strip()
     if not chat:
         return {"error": "chat is required (@username, id, or exact title)"}, 400
@@ -539,6 +603,8 @@ def handle_guard(data, headers):
     api_id, api_hash, err = api_creds(data)
     if err:
         return err
+    if guard_core is None:
+        return missing_module(GUARD_ERROR)
     chat = str(data.get("chat") or "").strip()
     if not chat:
         return {"error": "chat is required (@username, id, or exact title)"}, 400

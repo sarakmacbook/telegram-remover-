@@ -209,6 +209,47 @@ class BotDiagnosticsTests(unittest.TestCase):
         self.assertTrue(any("TELEGRAM_API_BASE" in h for h in result["hints"]))
 
 
+class MissingModuleTests(unittest.TestCase):
+    """A partially bundled deployment must explain itself, not return HTML."""
+
+    def test_missing_remover_core_answers_json(self):
+        with patch.object(api_common, "remover_core", None):
+            result, status = api_common.handle_clean(
+                {"api_id": "12345", "api_hash": "abc"},
+                {"X-Tg-Session": "session"})
+        self.assertEqual(status, 500)
+        self.assertIn("could not load", result["error"])
+        self.assertIn("redeploy", result["error"])
+
+    def test_missing_notify_answers_json_for_the_bot_card(self):
+        with patch.object(api_common, "notify", None):
+            result, status = api_common.handle_bot_connect(
+                {"bot_token": VALID_TOKEN, "chat_id": "987654321"})
+            self.assertEqual(status, 500)
+            self.assertIn("could not load", result["error"])
+            diagnostics, status = api_common.handle_bot_diagnostics()
+            self.assertEqual(status, 500)
+            self.assertIn("could not load", diagnostics["error"])
+
+    def test_missing_db_only_disables_storage(self):
+        with patch.object(api_common, "db", None):
+            self.assertIsNone(api_common._store())
+            self.assertFalse(api_common.handle_events({})["enabled"])
+
+    def test_null_notifier_swallows_everything(self):
+        notifier = api_common._NullNotifier()
+        self.assertFalse(notifier.enabled)
+        self.assertFalse(notifier.send("hi"))
+        self.assertFalse(notifier.send_guard({}))
+        self.assertFalse(notifier.send_run("wipe", "summary"))
+
+    def test_exec_does_not_dereference_a_missing_remover_core(self):
+        with patch.object(api_common, "remover_core", None):
+            result, status = api_common._exec("session", 12345, "abc", None)
+        self.assertEqual(status, 500)
+        self.assertIn("could not load", result["error"])
+
+
 class JsonErrorTests(unittest.TestCase):
     """A crashing function must answer JSON, never an HTML error page."""
 
