@@ -7,6 +7,10 @@ A CLI that runs on your account (MTProto user session via Telethon) and can:
   * clean-messages  — delete every message YOU sent, in every chat
   * wipe            — wipe the full history of a single chat
   * leave-all       — leave every group and channel you joined
+  * guard           — auto-mod: when somebody joins a group, delete the
+                      "X joined the group" message and optionally kick/ban
+                      them (needs a typed confirmation for anything that
+                      touches a person)
   * delete-account  — permanently delete your Telegram account
 
 The official Bot API cannot do any of this (it can't touch your private
@@ -26,8 +30,9 @@ import os
 import sys
 from pathlib import Path
 
-from telethon import TelegramClient, types
+from telethon import TelegramClient, events, types
 
+import guard_core
 import remover_core as core
 # re-exported for the test-suite (and anyone importing this module)
 from remover_core import (BATCH, FloodWait, classify, delete_account,  # noqa: F401
@@ -242,6 +247,165 @@ async def cmd_leave_all(args):
     await client.disconnect()
 
 
+# --------------------------------------------------------------------------
+# the join guard (auto-moderation of new members)
+# --------------------------------------------------------------------------
+
+def _guard_print(record):
+    """Console printer for guard audit records (loud for the scary ones)."""
+    print(guard_core.render_record(record), flush=True)
+    if record.get("status") == "paused":
+        print("  !! The join guard PAUSED itself (circuit breaker). Nobody will "
+              "be removed until you re-arm it.", flush=True)
+
+
+def _guard_policy(args):
+    """GuardPolicy from the command-line flags (with sanity checks)."""
+    if args.ban_hours and not args.ban_joiner:
+        sys.exit("ERROR: --ban-hours only makes sense together with --ban-joiner.")
+    if args.purge_joiner_messages and not (args.remove_joiner or args.ban_joiner):
+        sys.exit("ERROR: --purge-joiner-messages needs --remove-joiner or "
+                 "--ban-joiner (it deletes the messages of members you remove).")
+    return guard_core.GuardPolicy(
+        delete_join_message=args.delete_join_messages,
+        remove_joiner=args.remove_joiner,
+        ban_joiner=args.ban_joiner,
+        ban_seconds=int((args.ban_hours or 0) * 3600),
+        purge_joiner_messages=args.purge_joiner_messages,
+        include_added=args.include_added,
+        allow=list(args.allow or []),
+        protect_admins=not args.no_protect_admins,
+        max_actions_per_hour=args.max_actions,
+    )
+
+
+def _guard_arm(policy, args):
+    """Return the armed actions (and how they were armed).
+
+    The rule is deliberately blunt: ``kick``/``ban``/``purge`` never run
+    because a flag was passed — a human has to type the exact phrase
+    ("KICK", "BAN" or "KICK BAN") either at the prompt or with
+    ``--confirm-with``. Deleting the join notices just needs ``--yes``.
+    """
+    armed = {"delete"} if args.yes else set()
+    member_intent = set(policy.intent) & set(guard_core.MEMBER_ACTIONS)
+    if not member_intent:
+        return armed, "nothing member-level is armed"
+    confirmation = guard_core.required_confirmation(member_intent)
+
+    how = None
+    if args.confirm_with:
+        if args.confirm_with.strip() != confirmation:
+            sys.exit(f"ERROR: --confirm-with must be exactly {confirmation!r} "
+                     f"for the actions you selected.")
+        how = "--confirm-with on the command line"
+    elif sys.stdin.isatty():
+        print("\n" + "=" * 66)
+        print("This will REMOVE PEOPLE from your group — not just delete messages.")
+        for line in policy.describe():
+            print("  " + line)
+        print("=" * 66)
+        typed = input(f"Type {confirmation} (exactly) to arm it, "
+                      f"anything else aborts: ")
+        if typed.strip() != confirmation:
+            sys.exit("Aborted. Nothing was armed, nothing will be removed.")
+        how = "typed at the prompt"
+    else:
+        sys.exit(
+            f"ERROR: --remove-joiner/--ban-joiner/--purge-joiner-messages need a "
+            f"human to confirm.\n"
+            f"       Run this in a terminal (you will type {confirmation!r}), or "
+            f"pass --confirm-with {confirmation!r} if you really are running "
+            f"headless."
+        )
+    armed |= member_intent
+    return armed, how
+
+
+async def cmd_guard(args):
+    """Watch a group and act the moment somebody joins (auto-moderation)."""
+    client, _ = await connect(args)
+
+    targets = []
+    for query in args.chat:
+        entity = await resolve_entity(client, query)
+        kind = classify(entity)
+        if kind not in ("group", "supergroup", "channel"):
+            sys.exit(f"ERROR: --chat {query!r} is a {kind} chat, but the join "
+                     f"guard only works in groups and channels.")
+        targets.append((query, entity))
+
+    policy = _guard_policy(args)
+    if args.preview:
+        # Previewing is read-only: nothing needs confirming, nothing is armed.
+        armed, how = set(), "preview only (nothing is armed)"
+    else:
+        armed, how = _guard_arm(policy, args)
+
+    guard = guard_core.JoinGuard(policy, dry_run=not args.yes, armed=armed,
+                                 audit_path=args.log, on_record=_guard_print)
+
+    mode = "LIVE" if args.yes else "DRY RUN — nothing will be deleted, nobody removed"
+    print(f"\n=== JOIN GUARD ({mode}) ===")
+    print(f"  confirmation: {how}")
+    for line in policy.describe():
+        print("  " + line)
+    print(f"  armed actions: {', '.join(sorted(armed)) or 'none'}")
+
+    chats = {}
+    for query, entity in targets:
+        label = getattr(entity, "title", None) or query
+        try:
+            protected = await guard.prepare(client, entity, label=label)
+        except ValueError as e:
+            sys.exit(f"ERROR: {e}")
+        chats[guard_core.entity_id(entity)] = entity
+        chats[getattr(entity, "id", None)] = entity
+        print(f"  guarding '{label}' with {len(protected)} protected "
+              f"member(s) (you, admins, allow-list)")
+    if args.log:
+        print(f"  audit log: {args.log}")
+    print()
+
+    if args.preview:
+        for query, entity in targets:
+            label = getattr(entity, "title", None) or query
+            print(f"--- what the guard WOULD do to the newest {args.preview} "
+                  f"message(s) of '{label}' ---")
+            records = await guard.preview(client, entity, limit=args.preview,
+                                          label=label)
+            if not records:
+                print("  (no joins in that window — nothing to do)")
+            print()
+        print("Preview only: nothing was deleted and nobody was removed.")
+        print("Re-run without --preview to watch live.")
+        await client.disconnect()
+        return
+
+    @client.on(events.Raw(types=(types.UpdateNewMessage,
+                                 types.UpdateNewChannelMessage,
+                                 types.UpdateChatParticipantAdd,
+                                 types.UpdateChannelParticipant)))
+    async def _on_update(update):
+        try:
+            info = guard_core.join_info_from_update(update)
+            if not info:
+                return
+            entity = chats.get(info.get("chat_key"))
+            if entity is None:
+                return
+            await guard.handle(client, entity, info, sleep=True)
+        except Exception as e:  # noqa: BLE001 — never kill the watcher loop
+            print(f"  guard error: {type(e).__name__}: {e}", flush=True)
+
+    print(f"Watching {len(targets)} chat(s) for new members. "
+          f"Press Ctrl+C to stop.")
+    if not args.yes:
+        print("This is a DRY RUN: you will see what would happen, but nothing "
+              "is changed. Re-run with --yes to arm the deletions.")
+    await client.run_until_disconnected()
+
+
 async def cmd_delete_account(args):
     """Permanently delete the Telegram account. The nuclear option."""
     client, _ = await connect(args)
@@ -318,6 +482,45 @@ def build_parser():
     pl.add_argument("--yes", action="store_true",
                     help="actually leave (default: dry run)")
 
+    pg = sub.add_parser("guard",
+                        help="auto-mod: watch for new members and delete the "
+                             "'joined' message / remove / ban them "
+                             "(dry run unless --yes; removing people always "
+                             "needs a typed confirmation)")
+    pg.add_argument("--chat", action="append", required=True, metavar="CHAT",
+                    help="group to guard, repeatable (@username, id, or exact title)")
+    pg.add_argument("--yes", action="store_true",
+                    help="actually delete the 'joined' messages (default: dry run)")
+    pg.add_argument("--no-delete-join-messages", dest="delete_join_messages",
+                    action="store_false",
+                    help="do not delete the 'X joined' notices")
+    pg.add_argument("--remove-joiner", action="store_true",
+                    help="kick every new member (they may rejoin)")
+    pg.add_argument("--ban-joiner", action="store_true",
+                    help="ban every new member")
+    pg.add_argument("--ban-hours", type=float, default=0,
+                    help="ban duration in hours (0 = permanent, the default)")
+    pg.add_argument("--purge-joiner-messages", action="store_true",
+                    help="also delete the messages that joiner already sent here")
+    pg.add_argument("--include-added", action="store_true",
+                    help="also act when another member adds someone to the group")
+    pg.add_argument("--allow", action="append", default=[], metavar="USER",
+                    help="never touch this user, repeatable (@username or id)")
+    pg.add_argument("--no-protect-admins", action="store_true",
+                    help="also act on admins (NOT recommended)")
+    pg.add_argument("--max-actions", type=int,
+                    default=guard_core.DEFAULT_MAX_ACTIONS_PER_HOUR,
+                    help="circuit breaker: pause after this many member actions "
+                         "per hour (0 = unlimited; default: "
+                         f"{guard_core.DEFAULT_MAX_ACTIONS_PER_HOUR})")
+    pg.add_argument("--log", metavar="FILE",
+                    help="append every decision to this file as JSONL")
+    pg.add_argument("--confirm-with", metavar="TEXT",
+                    help="non-interactive confirmation, e.g. --confirm-with BAN")
+    pg.add_argument("--preview", type=int, metavar="N", default=0,
+                    help="show what the guard would do to the newest N "
+                         "messages, then exit (no confirmation needed)")
+
     pda = sub.add_parser("delete-account",
                          help="PERMANENTLY delete your Telegram account")
     pda.add_argument("--reason", default="User requested account deletion",
@@ -335,6 +538,7 @@ def main():
         "clean-messages": cmd_clean_messages,
         "wipe": cmd_wipe,
         "leave-all": cmd_leave_all,
+        "guard": cmd_guard,
         "delete-account": cmd_delete_account,
     }
     try:

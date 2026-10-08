@@ -26,6 +26,9 @@
   .chat .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .kind { font-size: .68rem; padding: 2px 7px; border-radius: 20px; background: #2a3550; color: #9aa7c4; text-transform: uppercase; }
   #log { background: #0b0f18; border: 1px solid #232d45; border-radius: 8px; padding: 10px; height: 180px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: .78rem; white-space: pre-wrap; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; margin: 4px 14px 4px 0; color: #e6e9f0; font-size: .85rem; }
+  .chk input { width: auto; }
+  .arm { background: #2a1d12; border: 1px solid #8a6a1f; border-radius: 8px; padding: 8px 10px; margin-top: 10px; font-size: .85rem; color: #f0d9a0; }
   .err { color: #ff7b72; } .ok { color: #7ee787; } .dim { color: #9aa7c4; }
   .hidden { display: none; }
   a { color: #5aa2ff; }
@@ -77,6 +80,43 @@
         <button class="danger" onclick="deleteAccount()">Delete my account</button>
       </div>
       <div id="chats" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" id="guardCard">
+      <h2 style="flex:1">Join guard <span class="kind">auto-mod</span></h2>
+      <div class="dim" style="font-size:.85rem; margin-bottom:6px">
+        Watches one group and acts the moment somebody joins — deletes the
+        "X joined the group" message and, if you arm it, removes or bans the
+        joiner. The first check only records where to start, so old history is
+        never touched. Anything that touches a person needs a typed
+        confirmation and pauses itself after too many actions in an hour.
+      </div>
+      <label>Group to guard (id, @username or exact title — "Guard" in the list above fills this in)</label>
+      <input id="guardChat" placeholder="-1001234567890 or @mygroup">
+      <div class="row" style="margin-top:8px">
+        <label class="chk"><input type="checkbox" id="gDelete" checked> delete "joined" message</label>
+        <label class="chk"><input type="checkbox" id="gKick"> remove (kick) joiner</label>
+        <label class="chk"><input type="checkbox" id="gBan"> ban joiner</label>
+        <label class="chk"><input type="checkbox" id="gPurge"> delete their messages here</label>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="gAdded"> also when a member adds someone</label>
+        <label class="chk"><input type="checkbox" id="gAdmins" checked> never touch admins</label>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>Ban for (hours, 0 = permanent)</label><input id="gBanHours" value="0" inputmode="decimal"></div>
+        <div style="flex:1"><label>Poll every (seconds)</label><input id="gPoll" value="8" inputmode="numeric"></div>
+        <div style="flex:1"><label>Pause after (member actions/hour)</label><input id="gMaxHour" value="30" inputmode="numeric"></div>
+      </div>
+      <label>Never touch these users (comma-separated @usernames or ids)</label>
+      <input id="gAllow" placeholder="@bestfriend, 123456789">
+      <div class="row" style="margin-top:10px">
+        <button class="ghost" onclick="guardPreview()">Preview what it would do</button>
+        <button class="ghost" onclick="guardStart(true)">Start dry run</button>
+        <button class="danger" onclick="guardStart(false)">Start LIVE</button>
+        <button class="ghost" onclick="guardStop(true)">Stop</button>
+      </div>
+      <div id="guardState" class="dim" style="margin-top:8px">Idle.</div>
     </div>
   </div>
 
@@ -171,6 +211,7 @@ async function signIn() {
 }
 
 function logout() {
+  guardStop();
   store("tg_session", null);
   S.session = "";
   $("main").classList.add("hidden");
@@ -200,7 +241,15 @@ async function loadChats() {
     b2.className = "danger";
     b2.textContent = "Wipe";
     b2.onclick = () => wipeChat(c);
-    row.appendChild(kind); row.appendChild(title); row.appendChild(b1); row.appendChild(b2);
+    const b3 = document.createElement("button");
+    b3.className = "ghost";
+    b3.textContent = "Guard";
+    b3.onclick = () => {
+      $("guardChat").value = String(c.id);
+      log("join guard: selected \"" + c.title + "\" — press Start.", "dim");
+    };
+    row.appendChild(kind); row.appendChild(title);
+    row.appendChild(b1); row.appendChild(b2); row.appendChild(b3);
     box.appendChild(row);
   }
   log("Loaded " + data.dialogs.length + " chats.");
@@ -264,6 +313,151 @@ async function leaveAll() {
     }
   }
   loadChats();
+}
+
+// ------------------------------------------------------------- join guard --
+const G = { timer: null, cursor: 0, dry: true, chat: "", confirm: "", actions: 0, stopped: true };
+
+function guardCls(r) {
+  if (r.status === "acted") return "ok";
+  if (r.status === "error" || r.status === "paused") return "err";
+  return "dim";
+}
+
+function guardPhrase(body) {
+  const words = [];
+  if (body.remove_joiner) words.push("KICK");
+  if (body.ban_joiner) words.push("BAN");
+  return words.join(" ");
+}
+
+function guardBody() {
+  const armed = [];
+  if ($("gDelete").checked) armed.push("delete");
+  if ($("gKick").checked) armed.push("kick");
+  if ($("gBan").checked) armed.push("ban");
+  if ($("gPurge").checked) armed.push("purge");
+  return {
+    chat: $("guardChat").value.trim(),
+    delete_join_message: $("gDelete").checked,
+    remove_joiner: $("gKick").checked,
+    ban_joiner: $("gBan").checked,
+    ban_hours: parseFloat($("gBanHours").value || "0") || 0,
+    purge_joiner_messages: $("gPurge").checked,
+    include_added: $("gAdded").checked,
+    protect_admins: $("gAdmins").checked,
+    allow: $("gAllow").value.split(",").map((s) => s.trim()).filter(Boolean),
+    max_actions_per_hour: parseInt($("gMaxHour").value || "30", 10) || 0,
+    armed,
+  };
+}
+
+function guardState() {
+  const el = $("guardState");
+  if (!el) return;
+  if (G.stopped || !G.timer) {
+    el.textContent = "Idle." + (G.actions ? " Last session did " + G.actions + " action(s)." : "");
+    return;
+  }
+  el.textContent = (G.dry ? "Running in DRY RUN" : "RUNNING LIVE")
+    + " on " + G.chat + " — watching from message " + G.cursor
+    + ", actions this session: " + G.actions;
+}
+
+function guardStop(announce) {
+  if (G.timer) clearTimeout(G.timer);
+  G.timer = null;
+  G.stopped = true;
+  G.confirm = "";
+  if (announce) log("join guard: stopped.", "dim");
+  guardState();
+}
+
+async function guardCall(body, cursor) {
+  return api("/api/guard", { ...creds(), ...body, cursor, dry_run: G.dry, confirm: G.confirm || "" });
+}
+
+async function guardPreview() {
+  const body = guardBody();
+  if (!body.chat) return log("join guard: enter the group to guard first.", "err");
+  // preview never writes and never needs the confirmation phrase
+  const { status, data } = await api("/api/guard",
+    { ...creds(), ...body, preview: true, dry_run: true, cursor: 0 });
+  if (data.flood_wait) return log("join guard: Telegram says wait " + data.flood_wait + "s — try again.", "dim");
+  if (status !== 200) return log("join guard preview: " + (data.error || status), "err");
+  const recs = data.records || [];
+  log("join guard preview — the current settings would affect " + recs.length + " join(s) in the newest messages:", "dim");
+  if (!recs.length) return log("  (nothing to do — no joins in that window)", "dim");
+  recs.forEach((r) => log("  " + (r.text || ""), guardCls(r)));
+}
+
+async function guardStart(dry) {
+  const body = guardBody();
+  if (!body.chat) return log("join guard: enter the group to guard first.", "err");
+  guardStop();
+  G.dry = !!dry;
+  G.chat = body.chat;
+  G.actions = 0;
+  G.cursor = 0;
+  G.stopped = false;
+
+  if (!dry) {
+    const phrase = guardPhrase(body);
+    log("join guard: arming LIVE in \"" + body.chat + "\"...", "err");
+    if (phrase) {
+      const typed = prompt("You are about to let the guard " + phrase +
+        " people in \"" + body.chat + "\".\n\nType " + phrase + " (exactly) to confirm:");
+      if (typed !== phrase) {
+        G.stopped = true;
+        guardState();
+        return log("join guard: aborted — the confirmation did not match.", "err");
+      }
+      G.confirm = phrase;
+    } else if (!confirm("Start LIVE in \"" + body.chat + "\" with only the 'delete joined message' action?")) {
+      G.stopped = true;
+      guardState();
+      return log("join guard: aborted.", "dim");
+    }
+  }
+  log("join guard: started " + (dry ? "in dry run" : "LIVE") + " in \"" + body.chat + "\".");
+  guardTick();
+}
+
+async function guardTick() {
+  if (G.stopped) return;
+  const body = guardBody();
+  const { status, data } = await guardCall(body, G.cursor);
+  if (data.flood_wait) {
+    log("join guard: Telegram says wait " + data.flood_wait + "s ...", "dim");
+    if (!G.stopped) G.timer = setTimeout(guardTick, (data.flood_wait + 1) * 1000);
+    return;
+  }
+  if (status !== 200) {
+    log("join guard: ERROR — " + (data.error || status), "err");
+    guardStop();
+    return;
+  }
+  if (data.baseline) {
+    G.cursor = data.next_cursor || 0;
+    log("join guard: watching from message " + G.cursor + " — only joins from now on.", "ok");
+  } else {
+    G.cursor = data.next_cursor || G.cursor;
+    (data.records || []).forEach((r) => log("  " + (r.text || ""), guardCls(r)));
+    G.actions += (data.records || []).filter((r) => r.status === "acted").length;
+    if (data.truncated) {
+      log("join guard: hit the per-call action cap — the rest continues on the next poll.", "dim");
+    }
+    if (data.paused) {
+      log("join guard: PAUSED by the circuit breaker (too many member actions this hour). " +
+          "Nothing else will run — press Start again when you are ready.", "err");
+      guardStop();
+      return;
+    }
+  }
+  guardState();
+  if (!G.stopped) {
+    G.timer = setTimeout(guardTick, Math.max(3, parseInt($("gPoll").value || "8", 10) || 8) * 1000);
+  }
 }
 
 async function deleteAccount() {
