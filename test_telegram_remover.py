@@ -3,10 +3,13 @@
 Run with:  python -m unittest discover -v
 """
 
+import contextlib
+import io
 import unittest
+import unittest.mock
 from unittest.mock import AsyncMock
 
-from telethon import errors
+from telethon import errors, types
 
 import telegram_remover as tr
 
@@ -170,6 +173,65 @@ class TestClassify(unittest.TestCase):
                              date=None, version=0)), "group")
 
 
+class TestGuardCommand(unittest.IsolatedAsyncioTestCase):
+    """`telegram_remover.py guard` end to end, with a fake Telegram client."""
+
+    async def run_guard(self, argv, client):
+        async def fake_connect(args, need_auth=True):
+            return client, "+85512345678"
+
+        original = tr.connect
+        tr.connect = fake_connect
+        out = io.StringIO()
+        try:
+            args = tr.build_parser().parse_args(["guard"] + argv)
+            with contextlib.redirect_stdout(out):
+                await tr.cmd_guard(args)
+        finally:
+            tr.connect = original
+        return out.getvalue()
+
+    def client_with_a_join(self):
+        from test_guard_core import FakeClient, service, supergroup, user
+
+        entity = supergroup()
+        return FakeClient(messages=[
+            service(8, types.MessageActionChatJoinedByRequest(), sender=42),
+        ], users=[user(42, "Spam", "Bot", "spammer")], admins=[7],
+            chats=[entity]), entity
+
+    async def test_preview_shows_what_would_happen_and_changes_nothing(self):
+        client, entity = self.client_with_a_join()
+        chat = str(tr.guard_core.chat_key(entity))
+        text = await self.run_guard(
+            ["--chat", chat, "--preview", "20", "--ban-joiner",
+             "--confirm-with", "BAN", "--yes"], client)
+
+        self.assertIn("would delete the join notice, ban the member", text)
+        self.assertIn("@spammer", text)   # the joiner is named, not just an id
+        self.assertIn("Preview only", text)
+        self.assertEqual(client.edits, [])            # nobody was banned
+        self.assertEqual(client.deleted_batches, [])  # nothing was deleted
+
+    async def test_preview_needs_no_confirmation(self):
+        client, entity = self.client_with_a_join()
+        chat = str(tr.guard_core.chat_key(entity))
+        text = await self.run_guard(
+            ["--chat", chat, "--preview", "20", "--remove-joiner"], client)
+        self.assertIn("would delete the join notice, remove (kick) the member", text)
+        self.assertIn("armed actions: none", text)   # preview arms nothing
+        self.assertEqual(client.edits, [])
+        self.assertEqual(client.kicks, [])
+
+    async def test_a_call_chat_is_refused(self):
+        client, _ = self.client_with_a_join()
+        from test_guard_core import FakeClient, user
+        client = FakeClient(users=[user(400, "Dm")], chats=[user(400, "Dm")])
+        chat = str(user(400).id)
+        with self.assertRaises(SystemExit):
+            await self.run_guard(["--chat", chat, "--preview", "5"], client)
+
+
 class TestParser(unittest.TestCase):
     def test_defaults_are_safe(self):
         args = tr.build_parser().parse_args(["clean-messages"])
@@ -184,6 +246,100 @@ class TestParser(unittest.TestCase):
         args = tr.build_parser().parse_args(
             ["leave-all", "--keep", "@a", "--keep", "@b"])
         self.assertEqual(args.keep, ["@a", "@b"])
+
+    def test_guard_defaults_are_safe(self):
+        args = tr.build_parser().parse_args(["guard", "--chat", "@g"])
+        self.assertFalse(args.yes)                 # dry run by default
+        self.assertTrue(args.delete_join_messages)
+        self.assertFalse(args.remove_joiner)       # nobody is removed...
+        self.assertFalse(args.ban_joiner)          # ...unless asked
+        self.assertFalse(args.purge_joiner_messages)
+        self.assertFalse(args.include_added)
+        self.assertEqual(args.ban_hours, 0)
+        self.assertEqual(args.max_actions, tr.guard_core.DEFAULT_MAX_ACTIONS_PER_HOUR)
+        self.assertEqual(args.preview, 0)
+
+    def test_guard_chat_is_repeatable(self):
+        args = tr.build_parser().parse_args(
+            ["guard", "--chat", "@a", "--chat", "123"])
+        self.assertEqual(args.chat, ["@a", "123"])
+
+
+class TestGuardPolicyAndArming(unittest.TestCase):
+    """The guard's safety rails on the CLI side."""
+
+    def parse(self, argv):
+        return tr.build_parser().parse_args(["guard"] + argv)
+
+    def test_ban_hours_requires_ban_joiner(self):
+        with self.assertRaises(SystemExit):
+            tr._guard_policy(self.parse(["--chat", "@g", "--ban-hours", "24"]))
+
+    def test_purge_requires_a_removal(self):
+        with self.assertRaises(SystemExit):
+            tr._guard_policy(self.parse(["--chat", "@g",
+                                         "--purge-joiner-messages"]))
+
+    def test_policy_is_built_from_the_flags(self):
+        args = self.parse(["--chat", "@g", "--ban-joiner", "--ban-hours", "24",
+                           "--purge-joiner-messages", "--allow", "@friend"])
+        policy = tr._guard_policy(args)
+        self.assertTrue(policy.ban_joiner)
+        self.assertEqual(policy.ban_seconds, 24 * 3600)
+        self.assertTrue(policy.purge_joiner_messages)
+        self.assertEqual(policy.allow, ["@friend"])
+        self.assertEqual(policy.confirmation, "BAN")
+
+    def test_removing_people_needs_a_matching_confirmation(self):
+        args = self.parse(["--chat", "@g", "--ban-joiner"])
+        policy = tr._guard_policy(args)
+        with self.assertRaises(SystemExit):
+            tr._guard_arm(policy, args)  # not a tty and no --confirm-with
+        args.confirm_with = "kick"
+        with self.assertRaises(SystemExit):
+            tr._guard_arm(policy, args)  # wrong phrase
+        args.confirm_with = "BAN"
+        armed, how = tr._guard_arm(policy, args)
+        self.assertIn("ban", armed)
+        self.assertIn("--confirm-with", how)
+
+    def test_delete_alone_needs_no_phrase(self):
+        args = self.parse(["--chat", "@g", "--yes"])
+        policy = tr._guard_policy(args)
+        armed, how = tr._guard_arm(policy, args)
+        self.assertEqual(armed, {"delete"})
+
+    def test_dry_run_arms_nothing(self):
+        args = self.parse(["--chat", "@g"])
+        policy = tr._guard_policy(args)
+        armed, _ = tr._guard_arm(policy, args)
+        self.assertEqual(armed, set())
+
+    def test_kick_and_ban_together_need_the_combined_phrase(self):
+        args = self.parse(["--chat", "@g", "--remove-joiner", "--ban-joiner"])
+        policy = tr._guard_policy(args)
+        self.assertEqual(policy.confirmation, "KICK BAN")
+        args.confirm_with = "KICK BAN"
+        armed, _ = tr._guard_arm(policy, args)
+        self.assertEqual(armed, {"kick", "ban"})
+
+    def test_interactive_prompt_can_arm(self):
+        args = self.parse(["--chat", "@g", "--remove-joiner"])
+        policy = tr._guard_policy(args)
+
+        class Tty:
+            def isatty(self):
+                return True
+
+        real_stdin = tr.sys.stdin
+        tr.sys.stdin = Tty()
+        try:
+            with unittest.mock.patch("builtins.input", return_value="KICK"):
+                armed, how = tr._guard_arm(policy, args)
+        finally:
+            tr.sys.stdin = real_stdin
+        self.assertEqual(armed, {"kick"})
+        self.assertIn("prompt", how)
 
 
 if __name__ == "__main__":

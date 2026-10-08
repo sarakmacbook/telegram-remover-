@@ -17,6 +17,7 @@ from flask import request
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
+import guard_core
 import remover_core
 
 DEFAULT_CHUNK = 200   # messages per /api/clean and /api/wipe call
@@ -262,6 +263,99 @@ def handle_leave(data, headers):
                                               me=me, sleep=False)
 
     return _exec(session, api_id, api_hash, work)
+
+
+def handle_guard(data, headers):
+    """The join guard: act on the joins that happened since ``cursor``.
+
+    Safety gates, all server-side (the browser cannot skip them):
+
+    * ``cursor`` is required unless the caller asks for a ``baseline`` (a
+      first call that only records "watch from here" — the guard never acts
+      on old history by accident).
+    * Deleting the join notices needs ``armed`` to contain ``"delete"``.
+    * Kicking/banning/purging needs ``armed`` **and** the exact confirmation
+      phrase in ``confirm`` whenever ``dry_run`` is false (HTTP 403
+      otherwise) — see ``guard_core.required_confirmation``.
+    * At most ``MAX_ACTIONS_PER_CALL`` member actions per request, and
+      ``JoinGuard`` pauses itself after ``max_actions_per_hour`` (default 30).
+    * Admins, the account owner and the allow-list are resolved on the server
+      and are never touched.
+    """
+    session, err = tg_session(headers)
+    if err:
+        return err
+    api_id, api_hash, err = api_creds(data)
+    if err:
+        return err
+    chat = str(data.get("chat") or "").strip()
+    if not chat:
+        return {"error": "chat is required (@username, id, or exact title)"}, 400
+    try:
+        cursor = max(0, int(data.get("cursor") or 0))
+        scan = int(data.get("scan") or guard_core.DEFAULT_SCAN)
+        max_actions = int(data.get("max_actions")
+                          or guard_core.DEFAULT_ACTIONS_PER_CALL)
+        ban_seconds = int(round(float(data.get("ban_hours") or 0) * 3600))
+        max_per_hour = int(data.get("max_actions_per_hour")
+                           or guard_core.DEFAULT_MAX_ACTIONS_PER_HOUR)
+    except (TypeError, ValueError):
+        return {"error": "cursor/scan/max_actions/ban_hours must be numbers"}, 400
+
+    armed_raw = data.get("armed") or []
+    if not isinstance(armed_raw, list):
+        return {"error": "armed must be a list of action names "
+                         f"({', '.join(guard_core.ACTIONS)})"}, 400
+    unknown = [str(a) for a in armed_raw if str(a) not in guard_core.ACTIONS]
+    if unknown:
+        return {"error": f"unknown armed action(s): {', '.join(unknown)}"}, 400
+    allow = data.get("allow") or []
+    if not isinstance(allow, list):
+        return {"error": "allow must be a list of @usernames or user ids"}, 400
+
+    dry_run = bool(data.get("dry_run", True))
+    preview = bool(data.get("preview", False))
+
+    policy = guard_core.GuardPolicy(
+        delete_join_message=bool(data.get("delete_join_message", True)),
+        remove_joiner=bool(data.get("remove_joiner")),
+        ban_joiner=bool(data.get("ban_joiner")),
+        ban_seconds=ban_seconds,
+        purge_joiner_messages=bool(data.get("purge_joiner_messages")),
+        include_added=bool(data.get("include_added")),
+        allow=allow,
+        protect_admins=bool(data.get("protect_admins", True)),
+        max_actions_per_hour=max_per_hour,
+    )
+    armed = {str(a) for a in armed_raw}
+    confirmation = policy.confirmation
+
+    if not dry_run and not preview and confirmation:
+        given = str(data.get("confirm") or "").strip()
+        if given != confirmation:
+            return {
+                "error": (f"refusing to kick/ban: type {confirmation!r} into the "
+                          f"confirmation box first (got {given!r})"),
+                "confirm_required": confirmation,
+            }, 403
+
+    async def work(client):
+        entity = await remover_core.resolve_entity(client, chat)
+        join_guard = guard_core.JoinGuard(policy, dry_run=dry_run or preview,
+                                          armed=armed, sleep=False)
+        await join_guard.prepare(client, entity)
+        result = await join_guard.scan(client, entity, cursor=cursor, scan=scan,
+                                       max_actions=max_actions, preview=preview)
+        for record in result.get("records") or []:
+            record["text"] = guard_core.render_record(record)
+        return result
+
+    result = _exec(session, api_id, api_hash, work)
+    if isinstance(result, tuple):      # an error response from _exec
+        return result
+    result["policy"] = policy.to_dict()
+    result["confirmation"] = confirmation
+    return result
 
 
 def handle_delete_account(data, headers):

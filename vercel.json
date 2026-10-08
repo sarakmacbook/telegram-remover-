@@ -3,7 +3,7 @@
     "api/*.py": {
       "maxDuration": 60,
       "memory": 1024,
-      "includeFiles": "{remover_core.py,api_common.py,index.html}"
+      "includeFiles": "{remover_core.py,guard_core.py,api_common.py,index.html}"
     }
   }
 }
