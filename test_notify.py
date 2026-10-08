@@ -35,6 +35,32 @@ class NotifyCase(unittest.TestCase):
         notify.urllib.request.urlopen = self._real
 
 
+class TestBotApiCall(NotifyCase):
+    def test_bot_token_shape_validation(self):
+        self.assertTrue(notify.valid_bot_token("123456789:ABC_def-123"))
+        self.assertFalse(notify.valid_bot_token("no-colon-token"))
+        self.assertFalse(notify.valid_bot_token("123456789:bad/token"))
+
+    def test_calls_the_named_method_and_returns_result(self):
+        result = notify.bot_api_call("TOKEN", "getMe", {"sample": True})
+        self.assertEqual(result, {})
+        self.assertEqual(len(self.sent), 1)
+        url, payload, timeout = self.sent[0]
+        self.assertIn("/botTOKEN/getMe", url)
+        self.assertEqual(payload, {"sample": True})
+        self.assertEqual(timeout, 10)
+
+    def test_telegram_error_description_is_reported_without_url(self):
+        def not_ok(request, timeout=None):
+            return FakeResponse(b'{"ok": false, "description": "Unauthorized"}')
+
+        notify.urllib.request.urlopen = not_ok
+        with self.assertRaises(notify.BotAPIError) as raised:
+            notify.bot_api_call("TOKEN", "getMe")
+        self.assertIn("Unauthorized", str(raised.exception))
+        self.assertNotIn("TOKEN", str(raised.exception))
+
+
 class TestSendMessage(NotifyCase):
     def test_send_posts_to_the_bot_api(self):
         ok = notify.send_message("TOKEN", 42, "hello")

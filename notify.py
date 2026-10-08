@@ -7,6 +7,9 @@ Configure with two environment variables (e.g. in ``.env``):
                            (your own user id, or a group the bot is in)
 
 ``TELEGRAM_NOTIFY=0`` keeps the bot silent while everything else still works.
+The web UI can instead provide a bot token and chat ID from its Telegram bot
+alerts card; those values are sent per request and never persisted by the
+server.
 
 Notifications are *best effort*: :meth:`Notifier.send` returns ``False`` on
 any problem and never raises, so a Telegram hiccup can never break a cleanup.
@@ -16,12 +19,67 @@ guard decisions (``send_guard``) or cleanup runs (``send_run``).
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
 API_BASE = "https://api.telegram.org"
 MAX_LEN = 4096          # Telegram's message length limit
 FALSEY = ("0", "false", "no", "off", "none")
+BOT_TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]+\Z")
+
+
+class BotAPIError(Exception):
+    """A request failed or the Telegram Bot API rejected it."""
+
+    def __init__(self, message, network=False):
+        super().__init__(message)
+        self.network = bool(network)
+
+
+def valid_bot_token(token):
+    """Return whether a value has the URL-safe shape of a Bot API token."""
+    token = str(token or "").strip()
+    return len(token) <= 256 and bool(BOT_TOKEN_RE.fullmatch(token))
+
+
+def bot_api_call(token, method, params=None, timeout=10):
+    """Call one Telegram Bot API method, returning ``result`` or raising.
+
+    Keep errors free of request URLs: the URL contains the secret bot token.
+    """
+    if not token or not method:
+        raise BotAPIError("bot token and method are required")
+    url = f"{API_BASE}/bot{token}/{method}"
+    request = urllib.request.Request(
+        url, data=json.dumps(params or {}).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8") or "{}"
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8") or "{}")
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            body = {}
+        detail = (body.get("description") if isinstance(body, dict) else None)
+        raise BotAPIError(str(detail or f"Telegram returned HTTP {e.code}")) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise BotAPIError(f"could not reach Telegram Bot API: {e}",
+                          network=True) from e
+    except (UnicodeDecodeError, ValueError) as e:
+        raise BotAPIError("Telegram returned an invalid response",
+                          network=True) from e
+
+    try:
+        body = json.loads(raw)
+    except (TypeError, ValueError) as e:
+        raise BotAPIError("Telegram returned an invalid response",
+                          network=True) from e
+    if not isinstance(body, dict) or not body.get("ok"):
+        detail = body.get("description") if isinstance(body, dict) else None
+        raise BotAPIError(str(detail or "Telegram Bot API request failed"))
+    return body.get("result")
 
 
 class Notifier:
@@ -63,20 +121,15 @@ def send_message(token, chat_id, text, timeout=10):
     """POST sendMessage to the Bot API. True on success, False on any error."""
     if not token or not chat_id or not text:
         return False
-    url = f"{API_BASE}/bot{token}/sendMessage"
     payload = {
         "chat_id": str(chat_id),
         "text": str(text)[:MAX_LEN],
         "disable_web_page_preview": True,
     }
-    request = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8") or "{}")
-        return bool(body.get("ok", False))
-    except (urllib.error.URLError, OSError, ValueError):
+        bot_api_call(token, "sendMessage", payload, timeout=timeout)
+        return True
+    except BotAPIError:
         return False
 
 
