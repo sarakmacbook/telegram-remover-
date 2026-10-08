@@ -181,8 +181,9 @@ Python serverless functions (`api/*.py`). Click the button:
    - `DATABASE_URL` — store guard/cleanup history in SQL (SQLite / Postgres /
      MySQL) and let the companion bot report on it. Without it the deployment
      stores nothing server-side.
-   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — push alerts about guard
-     actions and cleanups to your phone (see the bot section below).
+   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — default alerts for CLI and
+     web actions (see below). In the web UI, you can connect a browser-specific
+     bot instead without setting these environment variables.
 3. Open the deployment URL, log in with your phone number (Telegram sends you
    a code), and clean away.
 
@@ -203,10 +204,13 @@ expose it to your LAN).
 
 **How it works:** your Telegram session is a Telethon `StringSession` kept in
 your **browser's localStorage** and sent with each request — nothing is
-stored on the server. Long cleanups run in **chunks** (200 messages or 10
-chats per call) and the UI polls until done, so they work within Vercel's
-function time limits (`maxDuration: 60` in `vercel.json`; raise it if you're
-on a paid plan). Flood limits are surfaced to the UI, which waits and retries.
+stored on the server. If you connect a bot in the UI, its token and recipient
+ID are also kept in localStorage and sent only with requests that may produce
+an alert; the server uses them transiently. Long cleanups run in **chunks**
+(200 messages or 10 chats per call) and the UI polls until done, so they work
+within Vercel's function time limits (`maxDuration: 60` in `vercel.json`; raise
+it if you're on a paid plan). Flood limits are surfaced to the UI, which waits
+and retries.
 
 ## SQL history database (optional)
 
@@ -246,8 +250,18 @@ shows the same from a terminal.
 
 ## Telegram bot: alerts + status commands (optional)
 
-The Bot API cannot read your chats or delete anything — that stays the user
-session's job — but it is perfect for **alerts and remote control**:
+The Bot API cannot access or clean your personal-account chats — that stays
+the user session's job — but it is perfect for **alerts and remote control**.
+The web UI has a separate **Telegram bot alerts** connection: enter the token
+from [@BotFather](https://t.me/BotFather) and your Telegram user/chat ID, then
+choose **Connect & send test alert**. The UI verifies the bot with `getMe`,
+sends a test message, and saves the token/ID in that browser only. Subsequent
+web cleanup and guard requests use those values for alerts; they are not
+saved by the server. `TELEGRAM_NOTIFY=0` still disables automatic alerts.
+For private alerts, message your bot with `/start` first. This connection only
+sends notifications — personal-account actions still
+require the phone-based user session above. To use alerts from the CLI or run
+the companion command bot, configure the server/CLI environment as below.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), put the token in
    `TELEGRAM_BOT_TOKEN`.
@@ -313,6 +327,7 @@ notify.py             Telegram Bot API alerts (stdlib urllib, best effort)
 bot.py                companion bot: /status /recent /runs /pause /purge /db
 api_common.py         request helpers + handlers for the serverless endpoints
 api/*.py              one Vercel Python function per endpoint (Flask WSGI)
+                       including the browser bot-token test connection
 index.html            the web UI (vanilla JS, no build step)
 dev_server.py         run that web UI locally instead of on Vercel
 vercel.json           function config (maxDuration, includeFiles)

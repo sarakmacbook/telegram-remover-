@@ -1,8 +1,9 @@
 """Shared helpers for the Vercel serverless endpoints (api/*.py).
 
 Stateless design: the Telegram session is a Telethon ``StringSession`` sent
-by the browser (kept in localStorage) as the ``X-Tg-Session`` header. Nothing
-is stored server-side between requests.
+by the browser (kept in localStorage) as the ``X-Tg-Session`` header. Optional
+browser bot credentials are also sent per request for alerts; neither is
+stored server-side between requests.
 
 Set the ``ACCESS_TOKEN`` environment variable to password-protect the whole
 deployment — every request must then send it as ``X-Access-Token``.
@@ -40,16 +41,29 @@ def _store():
         return None
 
 
-def _notifier():
+def _notifier(headers=None):
+    """Use browser-provided bot settings for this request, else server env."""
     try:
+        if headers is not None:
+            token = (headers.get("X-Tg-Bot-Token") or "").strip()
+            chat_id = (headers.get("X-Tg-Bot-Chat-Id") or "").strip()
+            if token or chat_id:
+                # A partial/invalid browser config must not fall through to a
+                # different bot configured for the deployment.
+                if not notify.valid_bot_token(token) or not chat_id:
+                    return notify.Notifier("", "")
+                enabled = (os.environ.get("TELEGRAM_NOTIFY") or "1").strip().lower() \
+                    not in notify.FALSEY
+                return notify.Notifier(token, chat_id, enabled=enabled)
         return notify.Notifier.from_env()
     except Exception:  # noqa: BLE001
         return notify.Notifier("", "")
 
 
-def _record_run(action, summary, status="done", chat=None, details=None):
+def _record_run(action, summary, status="done", chat=None, details=None,
+                headers=None):
     """Store one cleanup run and push a Telegram summary (best effort)."""
-    store, notifier = _store(), _notifier()
+    store, notifier = _store(), _notifier(headers)
     if store is not None:
         try:
             store.record_run(action, status=status, chat=chat, details=details,
@@ -59,9 +73,9 @@ def _record_run(action, summary, status="done", chat=None, details=None):
     notifier.send_run(action, summary)
 
 
-def _record_guard(records):
+def _record_guard(records, headers=None):
     """Store guard audit records and push alerts for the loud ones."""
-    store, notifier = _store(), _notifier()
+    store, notifier = _store(), _notifier(headers)
     for record in records or []:
         if record.get("preview"):
             continue    # previews decide nothing real
@@ -145,6 +159,57 @@ def _chunk_params(data):
 # --------------------------------------------------------------------------
 # handlers (unit-testable without a Flask request context)
 # --------------------------------------------------------------------------
+
+def handle_bot_connect(data):
+    """Verify a browser-supplied bot token and deliver a one-time test alert.
+
+    Credentials are only used for these two Bot API calls and are never stored
+    by the server. The browser may keep them locally after this succeeds.
+    """
+    token = str(data.get("bot_token") or "").strip()
+    chat_id = str(data.get("chat_id") or "").strip()
+    if not token:
+        return {"error": "bot_token is required"}, 400
+    if not notify.valid_bot_token(token):
+        return {"error": "bot token has an invalid format"}, 400
+    if not chat_id:
+        return {"error": "chat_id is required (your Telegram user/chat ID)"}, 400
+    if len(chat_id) > 128 or any(ord(char) < 32 for char in chat_id):
+        return {"error": "chat_id is invalid"}, 400
+
+    try:
+        me = notify.bot_api_call(token, "getMe", timeout=10)
+    except notify.BotAPIError as e:
+        status = 502 if e.network else 400
+        return {"error": f"Could not verify the bot token: {e}"}, status
+    if not isinstance(me, dict):
+        return {"error": "Telegram returned an invalid bot profile"}, 502
+
+    try:
+        notify.bot_api_call(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "✅ telegram-remover: test alert — this bot can send messages to this chat.",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+    except notify.BotAPIError as e:
+        status = 502 if e.network else 400
+        return {
+            "error": ("The bot token is valid, but Telegram could not deliver "
+                      f"the test message: {e}. For a private chat, open the bot "
+                      "and send /start first, then check the chat ID."),
+        }, status
+
+    return {
+        "connected": True,
+        "test_message_sent": True,
+        "chat_id": chat_id,
+        "bot": {
+            "id": me.get("id"),
+            "username": me.get("username"),
+            "first_name": me.get("first_name"),
+        },
+    }
+
 
 def handle_auth_start(data):
     """Send a login code to the phone. Returns the phone_code_hash."""
@@ -268,7 +333,8 @@ def handle_clean(data, headers):
                        if result.get("failed") else ""),
                     status="done", chat=chat,
                     details={k: result.get(k) for k in
-                             ("processed", "deleted", "failed", "done")})
+                             ("processed", "deleted", "failed", "done")},
+                    headers=headers)
     return result
 
 
@@ -300,7 +366,8 @@ def handle_wipe(data, headers):
                        if result.get("failed") else ""),
                     status="done", chat=chat,
                     details={k: result.get(k) for k in
-                             ("processed", "deleted", "failed", "done")})
+                             ("processed", "deleted", "failed", "done")},
+                    headers=headers)
     return result
 
 
@@ -335,7 +402,8 @@ def handle_leave(data, headers):
                     + (f" ({result.get('failed', 0)} failed)"
                        if result.get("failed") else ""),
                     status="done",
-                    details={k: result.get(k) for k in ("left", "failed", "done")})
+                    details={k: result.get(k) for k in ("left", "failed", "done")},
+                    headers=headers)
     return result
 
 
@@ -447,7 +515,7 @@ def handle_guard(data, headers):
 
     # Mirror everything into the SQL database (events, cursor, status) so the
     # companion bot's /status, /recent and /pause work across machines.
-    _record_guard(result.get("records"))
+    _record_guard(result.get("records"), headers=headers)
     if store is not None and not preview:
         try:
             store.kv_set(f"guard:cursor:{chat}", result.get("next_cursor"))
@@ -480,7 +548,8 @@ def handle_delete_account(data, headers):
     result = _exec(session, api_id, api_hash, work)
     if isinstance(result, dict) and result.get("deleted"):
         _record_run("delete-account",
-                    "account permanently deleted", status="done")
+                    "account permanently deleted", status="done",
+                    headers=headers)
     return result
 
 

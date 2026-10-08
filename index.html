@@ -38,11 +38,11 @@
 <div class="wrap">
   <h1>telegram<span>-remover</span></h1>
   <div class="card warn">⚠️ This tool acts on <b>your own</b> Telegram account and
-  everything it does is <b>irreversible</b>. Your session is stored in
-  <b>this browser only</b> (localStorage). If the server has
-  <code>DATABASE_URL</code> set, only the guard/cleanup <b>history</b> is kept
-  in its SQL database (auto-purged every month). Only use a deployment you
-  trust.</div>
+  everything it does is <b>irreversible</b>. Your user session and any
+  optional bot token are stored in <b>this browser only</b> (localStorage). If
+  the server has <code>DATABASE_URL</code> set, only the
+  guard/cleanup <b>history</b> is kept in its SQL database (auto-purged every
+  month). Only use a deployment you trust.</div>
 
   <div class="card" id="loginCard">
     <h2>Connect</h2>
@@ -65,6 +65,32 @@
       <div class="row" style="margin-top:10px">
         <button onclick="signIn()">Sign in</button>
       </div>
+    </div>
+  </div>
+
+  <div class="card" id="botCard">
+    <h2>Telegram bot alerts <span class="kind">optional</span></h2>
+    <div class="dim" style="font-size:.85rem; margin-bottom:6px">
+      Connect with a Bot API token from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>
+      and your Telegram user/chat ID. This only sends alerts; it does not log
+      in as your account or replace the phone login above. For a private chat,
+      open your bot and send <code>/start</code> first.
+    </div>
+    <label>Bot API token</label>
+    <input id="botToken" type="password" autocomplete="off" placeholder="123456789:AA...">
+    <label>Your Telegram user/chat ID (Bot API chat_id)</label>
+    <input id="botChatId" inputmode="decimal" autocomplete="off" placeholder="123456789 or -1001234567890">
+    <div class="row" style="margin-top:10px">
+      <button onclick="connectBot()">Connect &amp; send test alert</button>
+      <button class="ghost" onclick="disconnectBot()">Disconnect / forget</button>
+    </div>
+    <div id="botStatus" class="dim" style="margin-top:8px">Not connected.</div>
+    <div class="dim" style="font-size:.78rem; margin-top:6px">
+      The token is kept in this browser and sent to the server only to verify
+      the bot and send a test message or action alert. A server-level
+      <code>TELEGRAM_NOTIFY=0</code> setting still mutes automatic alerts.
+      Revoke a token with @BotFather if
+      it is exposed. Connecting here is independent of the account login.
     </div>
   </div>
 
@@ -150,12 +176,17 @@ const S = {
   apiId: localStorage.getItem("tg_api_id") || "",
   apiHash: localStorage.getItem("tg_api_hash") || "",
   accessToken: localStorage.getItem("tg_access_token") || "",
+  botToken: localStorage.getItem("tg_bot_token") || "",
+  botChatId: localStorage.getItem("tg_bot_chat_id") || "",
+  botUsername: localStorage.getItem("tg_bot_username") || "",
   session: localStorage.getItem("tg_session") || "",
   phoneCodeHash: "",
 };
 $("apiId").value = S.apiId;
 $("apiHash").value = S.apiHash;
 $("accessToken").value = S.accessToken;
+$("botToken").value = S.botToken;
+$("botChatId").value = S.botChatId;
 
 function log(msg, cls) {
   const el = $("log");
@@ -168,19 +199,86 @@ function log(msg, cls) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const creds = () => ({ api_id: S.apiId, api_hash: S.apiHash });
 
-async function api(path, body) {
+async function api(path, body, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Tg-Session": S.session,
+    "X-Access-Token": S.accessToken,
+  };
+  if (options.botAlerts && S.botToken && S.botChatId) {
+    headers["X-Tg-Bot-Token"] = S.botToken;
+    headers["X-Tg-Bot-Chat-Id"] = S.botChatId;
+  }
   const res = await fetch(path, {
     method: body == null ? "GET" : "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Tg-Session": S.session,
-      "X-Access-Token": S.accessToken,
-    },
+    headers,
     body: body == null ? undefined : JSON.stringify(body),
   });
   let data = {};
   try { data = await res.json(); } catch (e) { /* non-JSON response */ }
   return { status: res.status, data };
+}
+
+function renderBotStatus(message, cls = "dim") {
+  const el = $("botStatus");
+  if (!el) return;
+  if (message) {
+    el.className = cls;
+    el.textContent = message;
+    return;
+  }
+  el.className = "dim";
+  el.textContent = (S.botToken && S.botChatId)
+    ? "Saved in this browser for " +
+      (S.botUsername ? "@" + S.botUsername : "chat " + S.botChatId) +
+      ". Reconnect to send a fresh test alert."
+    : "Not connected.";
+}
+
+async function connectBot() {
+  const token = $("botToken").value.trim();
+  const chatId = $("botChatId").value.trim();
+  if (!token || !chatId) {
+    return renderBotStatus("Enter both the bot token and your Telegram user/chat ID.", "err");
+  }
+  renderBotStatus("Verifying the token and sending a test alert…");
+  try {
+    const { status, data } = await api("/api/bot_connect", {
+      bot_token: token,
+      chat_id: chatId,
+    });
+    if (status !== 200 || !data.connected) {
+      const previous = S.botToken && S.botChatId
+        ? " The previously saved bot remains active."
+        : "";
+      return renderBotStatus((data.error || "Could not connect the bot.") + previous, "err");
+    }
+    S.botToken = token;
+    S.botChatId = chatId;
+    S.botUsername = (data.bot && data.bot.username) || "";
+    store("tg_bot_token", S.botToken);
+    store("tg_bot_chat_id", S.botChatId);
+    store("tg_bot_username", S.botUsername);
+    const botName = S.botUsername ? "@" + S.botUsername : "your bot";
+    renderBotStatus("Connected to " + botName + "; test alert sent to chat " + chatId +
+      ". This browser will use it for cleanup and guard alerts.", "ok");
+    log("Telegram bot alerts connected as " + botName + " ✔", "ok");
+  } catch (e) {
+    renderBotStatus("Could not reach this server. Check your connection and try again.", "err");
+  }
+}
+
+function disconnectBot() {
+  store("tg_bot_token", null);
+  store("tg_bot_chat_id", null);
+  store("tg_bot_username", null);
+  S.botToken = "";
+  S.botChatId = "";
+  S.botUsername = "";
+  $("botToken").value = "";
+  $("botChatId").value = "";
+  renderBotStatus("Bot credentials forgotten in this browser. Server environment settings are unchanged.");
+  log("Telegram bot alerts disconnected from this browser.", "dim");
 }
 
 async function sendCode() {
@@ -276,7 +374,8 @@ async function loadChats() {
 async function runChunked(path, body, label) {
   let cursor = 0, total = 0, failed = 0;
   for (;;) {
-    const { status, data } = await api(path, { ...body, ...creds(), cursor });
+    const { status, data } = await api(path, { ...body, ...creds(), cursor },
+      { botAlerts: true });
     if (data.flood_wait) {
       log(label + ": Telegram says wait " + data.flood_wait + "s ...", "dim");
       await sleep(data.flood_wait * 1000 + 500);
@@ -312,7 +411,8 @@ async function leaveAll() {
   if (!confirm("Leave ALL groups and channels? (the keep-list is respected)")) return;
   let total = 0;
   for (;;) {
-    const { status, data } = await api("/api/leave", { ...creds(), keep, limit: 10 });
+    const { status, data } = await api("/api/leave", { ...creds(), keep, limit: 10 },
+      { botAlerts: true });
     if (data.flood_wait) {
       log("leave-all: Telegram says wait " + data.flood_wait + "s ...", "dim");
       await sleep(data.flood_wait * 1000 + 500);
@@ -391,7 +491,9 @@ function guardStop(announce) {
 }
 
 async function guardCall(body, cursor) {
-  return api("/api/guard", { ...creds(), ...body, cursor, dry_run: G.dry, confirm: G.confirm || "" });
+  return api("/api/guard", {
+    ...creds(), ...body, cursor, dry_run: G.dry, confirm: G.confirm || "",
+  }, { botAlerts: true });
 }
 
 async function guardPreview() {
@@ -480,7 +582,9 @@ async function guardTick() {
 async function deleteAccount() {
   const typed = prompt("This PERMANENTLY deletes your Telegram account.\nType DELETE to confirm:");
   if (typed !== "DELETE") return log("Aborted.", "dim");
-  const { data } = await api("/api/delete_account", { ...creds(), reason: "Deleted via telegram-remover web UI" });
+  const { data } = await api("/api/delete_account", {
+    ...creds(), reason: "Deleted via telegram-remover web UI",
+  }, { botAlerts: true });
   if (data.deleted) {
     log("Account deleted. ✔", "ok");
     logout();
@@ -527,6 +631,7 @@ async function loadHistory() {
   el.textContent = lines.join("\n");
 }
 
+renderBotStatus();
 if (S.session) {
   $("loginCard").classList.add("hidden");
   $("main").classList.remove("hidden");
