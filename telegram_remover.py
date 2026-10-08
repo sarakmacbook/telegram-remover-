@@ -12,10 +12,17 @@ A CLI that runs on your account (MTProto user session via Telethon) and can:
                       them (needs a typed confirmation for anything that
                       touches a person)
   * delete-account  — permanently delete your Telegram account
+  * db             — inspect / purge the SQL history database
+
+Everything a mutating command does can be stored in a SQL database
+(SQLite / PostgreSQL / MySQL — see db.py) and pushed to you as a Telegram
+notification; a companion bot (bot.py) answers /status and /recent and can
+/pause the guard from anywhere.
 
 The official Bot API cannot do any of this (it can't touch your private
 chats, act as you, or leave groups on your behalf), which is why this tool
-uses a user session, exactly like Telegram Desktop does.
+uses a user session, exactly like Telegram Desktop does. The Bot API is used
+only for the optional alerts/status bot.
 
 SAFETY: every destructive command is a DRY RUN unless you pass --yes.
 Nothing is deleted until you say so.
@@ -28,11 +35,14 @@ import argparse
 import asyncio
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events, types
 
+import db
 import guard_core
+import notify
 import remover_core as core
 # re-exported for the test-suite (and anyone importing this module)
 from remover_core import (BATCH, FloodWait, classify, delete_account,  # noqa: F401
@@ -72,6 +82,59 @@ async def connect(args, need_auth=True):
         await client.disconnect()
         sys.exit("Not logged in. Run first:  python telegram_remover.py login")
     return client, phone
+
+
+# --------------------------------------------------------------------------
+# SQL database + Telegram notifications (optional, best effort)
+# --------------------------------------------------------------------------
+
+def open_store(args):
+    """The SQL store for this run: on by default, --no-db turns it off.
+
+    ``--db [URL]`` overrides the URL (default sqlite file, or DATABASE_URL).
+    Returns None when disabled. A store problem must never break a cleanup,
+    so any error here degrades to "no database" with a warning.
+    """
+    if getattr(args, "no_db", False):
+        return None
+    url = args.db if args.db not in (None, "default") else None
+    try:
+        return db.get_store(url, default=True)
+    except Exception as e:  # noqa: BLE001 — storage is optional
+        print(f"NOTE: SQL storage unavailable ({e}) — continuing without it.")
+        return None
+
+
+def open_notifier():
+    """Telegram notifier from the environment (disabled if unconfigured)."""
+    try:
+        return notify.Notifier.from_env()
+    except Exception:  # noqa: BLE001 — notifications are optional
+        return notify.Notifier("", "")
+
+
+def report_run(store, notifier, action, summary, chat=None, status="done",
+               details=None):
+    """Store one cleanup run in SQL and push a Telegram summary (best effort)."""
+    if store is not None:
+        try:
+            store.record_run(action, status=status, chat=chat,
+                             details=details, source="cli")
+        except Exception as e:  # noqa: BLE001
+            print(f"NOTE: could not store the run in SQL ({e}).")
+    if notifier is not None:
+        notifier.send_run(action, summary)
+
+
+def report_event(store, notifier, record):
+    """Store one guard record in SQL and push an alert (best effort)."""
+    if store is not None:
+        try:
+            store.record_guard(record, source="cli")
+        except Exception as e:  # noqa: BLE001
+            print(f"NOTE: could not store the event in SQL ({e}).")
+    if notifier is not None and record.get("status") != "ignored":
+        notifier.send_guard(record)
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +202,7 @@ async def cmd_dialogs(args):
 
 async def cmd_clean_messages(args):
     """Delete every message sent by YOU, everywhere (or in one chat)."""
+    store, notifier = open_store(args), open_notifier()
     client, _ = await connect(args)
     me = await client.get_me()
 
@@ -172,11 +236,19 @@ async def cmd_clean_messages(args):
           + (f" ({total_failed} failed)" if total_failed else ""))
     if not args.yes and total:
         print("Re-run with --yes to actually delete them.")
+    report_run(store, notifier, "clean-messages",
+               f"{'deleted' if args.yes else 'would delete'} {total} "
+               f"message(s) in {len(targets)} chat(s)"
+               + (f", {total_failed} failed" if total_failed else ""),
+               chat=args.chat, status="done" if args.yes else "dry_run",
+               details={"processed": total, "failed": total_failed,
+                        "chats": len(targets), "dry_run": not args.yes})
     await client.disconnect()
 
 
 async def cmd_wipe(args):
     """Wipe the FULL history of one chat (both sides where permitted)."""
+    store, notifier = open_store(args), open_notifier()
     client, _ = await connect(args)
     entity = await resolve_entity(client, args.chat)
     label = getattr(entity, "title", None) or getattr(entity, "first_name", None) \
@@ -192,11 +264,19 @@ async def cmd_wipe(args):
         print("Re-run with --yes to actually delete them.")
     if args.yes and processed:
         print("Note: if Telegram cut us off mid-wipe, just re-run the command.")
+    report_run(store, notifier, "wipe",
+               f"{'wiped' if args.yes else 'would wipe'} {processed} "
+               f"message(s) of '{label}'"
+               + (f", {failed} failed" if failed else ""),
+               chat=args.chat, status="done" if args.yes else "dry_run",
+               details={"processed": processed, "failed": failed,
+                        "dry_run": not args.yes})
     await client.disconnect()
 
 
 async def cmd_leave_all(args):
     """Leave every group and channel (with an optional keep-list)."""
+    store, notifier = open_store(args), open_notifier()
     client, _ = await connect(args)
     me = await client.get_me()
 
@@ -244,6 +324,13 @@ async def cmd_leave_all(args):
               f"in private chats")
     if not args.yes and left:
         print("Re-run with --yes to actually leave them.")
+    report_run(store, notifier, "leave-all",
+               f"{'left' if args.yes else 'would leave'} {left} chat(s)"
+               + (f", {failed} failed" if failed else "")
+               + (f"; wiped {wiped} private message(s)" if wiped else ""),
+               status="done" if args.yes else "dry_run",
+               details={"left": left, "failed": failed, "wiped": wiped,
+                        "dry_run": not args.yes})
     await client.disconnect()
 
 
@@ -257,6 +344,38 @@ def _guard_print(record):
     if record.get("status") == "paused":
         print("  !! The join guard PAUSED itself (circuit breaker). Nobody will "
               "be removed until you re-arm it.", flush=True)
+
+
+def _guard_sink(store, notifier):
+    """on_record callback: console + SQL + Telegram, best effort."""
+    def sink(record):
+        _guard_print(record)
+        if record.get("preview"):
+            return          # previews decide nothing real — no storage/alerts
+        report_event(store, notifier, record)
+        if store is not None:
+            try:
+                status = store.kv_get("guard:status") or {}
+                status["last_record"] = guard_core.render_record(record)
+                store.kv_set("guard:status", status)
+            except Exception:  # noqa: BLE001 — storage is optional
+                pass
+    return sink
+
+
+def _guard_status(store, guard=None, **fields):
+    """Merge fields into the shared 'guard:status' kv (for /status in the bot)."""
+    if store is None:
+        return
+    try:
+        status = store.kv_get("guard:status") or {}
+        if guard is not None:
+            fields.setdefault("summary", guard_core.summarize(
+                [r for r in guard.records if not r.get("preview")]))
+        status.update(fields)
+        store.kv_set("guard:status", status)
+    except Exception:  # noqa: BLE001 — storage is optional
+        pass
 
 
 def _guard_policy(args):
@@ -324,6 +443,7 @@ def _guard_arm(policy, args):
 
 async def cmd_guard(args):
     """Watch a group and act the moment somebody joins (auto-moderation)."""
+    store, notifier = open_store(args), open_notifier()
     client, _ = await connect(args)
 
     targets = []
@@ -342,8 +462,11 @@ async def cmd_guard(args):
     else:
         armed, how = _guard_arm(policy, args)
 
-    guard = guard_core.JoinGuard(policy, dry_run=not args.yes, armed=armed,
-                                 audit_path=args.log, on_record=_guard_print)
+    guard = guard_core.JoinGuard(
+        policy, dry_run=not args.yes, armed=armed, audit_path=args.log,
+        on_record=_guard_sink(store, notifier),
+        # the Telegram bot's /pause is a kill switch for every live action
+        pause_check=lambda: bool(store and store.kv_get("guard:paused")))
 
     mode = "LIVE" if args.yes else "DRY RUN — nothing will be deleted, nobody removed"
     print(f"\n=== JOIN GUARD ({mode}) ===")
@@ -353,6 +476,7 @@ async def cmd_guard(args):
     print(f"  armed actions: {', '.join(sorted(armed)) or 'none'}")
 
     chats = {}
+    labels = []
     for query, entity in targets:
         label = getattr(entity, "title", None) or query
         try:
@@ -361,10 +485,34 @@ async def cmd_guard(args):
             sys.exit(f"ERROR: {e}")
         chats[guard_core.entity_id(entity)] = entity
         chats[getattr(entity, "id", None)] = entity
+        labels.append(label)
         print(f"  guarding '{label}' with {len(protected)} protected "
               f"member(s) (you, admins, allow-list)")
     if args.log:
         print(f"  audit log: {args.log}")
+
+    # Everything is mirrored into the SQL database so the Telegram bot's
+    # /status, /recent and /pause work across machines (best effort).
+    if store is not None:
+        try:
+            store.kv_set("guard:policy", policy.to_dict())
+            store.kv_set("guard:allow", sorted(policy.allow))
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"  SQL store: {db.redact_url(store.url)} "
+              f"(kept {store.retention_days} days — see: "
+              f"python telegram_remover.py db status)")
+        if notifier.enabled:
+            print(f"  Telegram alerts -> chat {notifier.chat_id} "
+                  f"(companion bot: python bot.py)")
+    if not args.preview:
+        _guard_status(store, mode=("LIVE" if args.yes else "DRY RUN"),
+                      chats=labels, armed=sorted(armed),
+                      started=datetime.now(timezone.utc).isoformat(
+                          timespec="seconds"))
+        notifier.send_run("guard",
+                          f"started ({'LIVE' if args.yes else 'dry run'}) on "
+                          + ", ".join(labels))
     print()
 
     if args.preview:
@@ -403,11 +551,18 @@ async def cmd_guard(args):
     if not args.yes:
         print("This is a DRY RUN: you will see what would happen, but nothing "
               "is changed. Re-run with --yes to arm the deletions.")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        _guard_status(store, guard=guard, mode="stopped",
+                      stopped=datetime.now(timezone.utc).isoformat(
+                          timespec="seconds"))
+        notifier.send_run("guard", "stopped on " + ", ".join(labels))
 
 
 async def cmd_delete_account(args):
     """Permanently delete the Telegram account. The nuclear option."""
+    store, notifier = open_store(args), open_notifier()
     client, _ = await connect(args)
     me = await client.get_me()
     name = f"{me.first_name or ''} {me.last_name or ''}".strip()
@@ -426,6 +581,8 @@ async def cmd_delete_account(args):
         return
     await core.delete_account(client, args.reason)
     print("Account deleted. The session is now invalid.")
+    report_run(store, notifier, "delete-account",
+               "account permanently deleted", status="done")
     try:
         await client.disconnect()
     except Exception:
@@ -434,6 +591,47 @@ async def cmd_delete_account(args):
     for suffix in (".session", ".session-journal"):
         Path(str(args.session) + suffix).unlink(missing_ok=True)
     print(f"Local session file '{args.session}.session' removed.")
+
+
+# --------------------------------------------------------------------------
+# the SQL history database
+# --------------------------------------------------------------------------
+
+async def cmd_db(args):
+    """Inspect or purge the SQL history database (events, runs, config)."""
+    store = open_store(args)
+    if store is None:
+        sys.exit("SQL storage is off (--no-db). Re-run without --no-db, or "
+                 "set DATABASE_URL.")
+    if args.db_command == "status":
+        stats = store.stats()
+        print(f"Database:  {stats['url']}")
+        print(f"Events:    {stats['events']}  (oldest: {stats['oldest_event'] or '—'})")
+        print(f"Runs:      {stats['runs']}")
+        print(f"KV config: {stats['kv']} entries "
+              f"(pause flag, guard status, allow-list, cursors)")
+        print(f"Retention: {stats['retention_days']} days — rows older than "
+              f"that are purged automatically (every month)")
+        paused = store.kv_get("guard:paused")
+        print(f"Guard pause flag: {'PAUSED (/resume in the bot)' if paused else 'not set'}")
+    elif args.db_command == "events":
+        for e in store.list_events(limit=args.n or 10):
+            who = e.get("user_label") or (f"id {e['user_id']}" if e.get("user_id") else "—")
+            chat = e.get("chat_label") or e.get("chat_key") or "?"
+            print(f"[{e['time']}] {chat}: {who} — {e.get('status')}"
+                  + (f" ({e['reason']})" if e.get("reason") else ""))
+    elif args.db_command == "runs":
+        for r in store.list_runs(limit=args.n or 10):
+            print(f"[{r['time']}] {r['action']} — {r.get('status')}"
+                  + (f" in {r['chat']}" if r.get("chat") else "")
+                  + (f" {r['details']}" if r.get("details") else ""))
+    elif args.db_command == "purge":
+        res = store.purge_old(days=args.days, include_kv=args.all)
+        what = " (including kv config)" if args.all else ""
+        print(f"Purged {res['events']} event(s) and {res['runs']} run(s){what} "
+              f"older than {res['days']} day(s) (cutoff {res['cutoff']}).")
+        print("Rows older than the retention window are also purged "
+              "automatically every time the database is opened.")
 
 
 # --------------------------------------------------------------------------
@@ -448,6 +646,12 @@ def build_parser():
     )
     p.add_argument("--session", default=os.environ.get("SESSION_PATH", "telegram_remover"),
                    help="session file name (default: telegram_remover)")
+    p.add_argument("--db", nargs="?", const="default", default=None, metavar="URL",
+                   help="SQL history database (on by default: DATABASE_URL or "
+                        "sqlite:///telegram_remover.db). Pass a SQLAlchemy URL "
+                        "to use PostgreSQL/MySQL instead.")
+    p.add_argument("--no-db", action="store_true",
+                   help="do not record anything in a SQL database")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("login", help="log in with your phone number (one-time setup)")
@@ -527,6 +731,18 @@ def build_parser():
                      help="reason sent to Telegram")
     pda.add_argument("--yes", action="store_true",
                      help="skip the first confirmation (you must still type DELETE)")
+
+    pd = sub.add_parser("db", help="inspect or purge the SQL history database")
+    pd.add_argument("db_command", choices=["status", "events", "runs", "purge"],
+                    default="status", nargs="?", metavar="COMMAND",
+                    help="status (default) | events | runs | purge")
+    pd.add_argument("-n", type=int, default=10,
+                    help="how many rows for events/runs (default 10)")
+    pd.add_argument("--days", type=int, default=None,
+                    help="purge: delete rows older than this many days "
+                         "(default: the retention window, 30)")
+    pd.add_argument("--all", action="store_true",
+                    help="purge: also drop old kv config entries")
     return p
 
 
@@ -540,6 +756,7 @@ def main():
         "leave-all": cmd_leave_all,
         "guard": cmd_guard,
         "delete-account": cmd_delete_account,
+        "db": cmd_db,
     }
     try:
         asyncio.run(handlers[args.command](args))

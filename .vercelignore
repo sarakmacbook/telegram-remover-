@@ -7,3 +7,11 @@ __pycache__
 .git
 .vercel
 node_modules
+# local tooling / CLI / tests / companion bot — the API needs none of it
+telegram_remover.py
+bot.py
+dev_server.py
+test_*.py
+*.db
+*.sqlite
+*.sqlite3
