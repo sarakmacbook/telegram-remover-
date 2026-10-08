@@ -191,6 +191,13 @@ Python serverless functions (`api/*.py`). Click the button:
 3. Open the deployment URL, log in with your phone number (Telegram sends you
    a code), and clean away.
 
+**Deployment Protection.** If the project keeps *Settings → Deployment
+Protection → Vercel Authentication* enabled, only browsers logged in to Vercel
+can load the page **and** call `/api/*`; everything else (your phone, `curl`,
+the page's own `fetch()` calls in a browser without the Vercel session) hits
+the login wall. Disable it for a deployment you want to use from your own
+devices, or keep it and stay logged in to Vercel where you use the app.
+
 **The join guard in the browser.** Vercel functions cannot stay awake, so the
 *Join guard* card works by **polling**: the first check only records "watch
 from here", and every poll (default: every 8 s) asks `/api/guard` to handle the
@@ -271,6 +278,34 @@ such as `@mychannel` are also accepted by Telegram. If the deployment has
 connection only sends notifications — personal-account actions still require
 the phone-based user session above. To use alerts from the CLI or run the
 companion command bot, configure the server/CLI environment as below.
+
+**"Could not connect the bot."** Press **Check server** in the card (it calls
+`GET /api/bot_connect`) or open `https://your-deployment/api/bot_connect` in a
+browser: the JSON answer names the Bot API host in use, whether the deployment
+can reach it, and what would stop a connect attempt. The usual causes:
+
+* **The server cannot reach the Bot API.** The connect happens server-side, so
+  a sandbox, container or corporate network that blocks `api.telegram.org`
+  always fails here even when Telegram works fine on your phone. Hosted
+  deployments such as Vercel can reach it; anywhere else point
+  `TELEGRAM_API_BASE` at a reachable Bot API server or provide an
+  `HTTPS_PROXY` for the process.
+* **A stale build or a static host.** `POST /api/bot_connect` must exist on the
+  deployment that served `index.html` (a 404 means the old build is still
+  live — redeploy). The API also answers JSON, not HTML: if the error mentions
+  "HTTP 500" or an HTML page, read the function logs.
+* **Vercel Deployment Protection.** With *Vercel Authentication* enabled,
+  every request — including `fetch()` calls from the page — must carry a
+  Vercel login, so the UI cannot reach the API. Turn it off under
+  *Project → Settings → Deployment Protection → Vercel Authentication →
+  Disabled*, or open the page in a browser that is logged in to Vercel.
+* **`ACCESS_TOKEN`.** If the deployment sets it, enter the same value in the
+  *Access token* field before connecting the bot (the card sends it as
+  `X-Access-Token`).
+* **The chat, not the token.** `Unauthorized`/`Not Found` means the token is
+  wrong (copy the whole token from @BotFather, without a leading `bot` or a
+  URL); `chat not found` / `bot can't initiate conversation` means the chat ID
+  or the `/start` step — see below.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), put the token in
    `TELEGRAM_BOT_TOKEN`.

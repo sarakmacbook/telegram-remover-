@@ -87,9 +87,11 @@
     </div>
     <div class="row" style="margin-top:10px">
       <button onclick="connectBot()">Connect &amp; send test alert</button>
+      <button class="ghost" onclick="checkBotServer()">Check server</button>
       <button class="ghost" onclick="disconnectBot()">Disconnect / forget</button>
     </div>
-    <div id="botStatus" class="dim" style="margin-top:8px">Not connected.</div>
+    <div id="botStatus" class="dim"
+         style="margin-top:8px; white-space:pre-line">Not connected.</div>
     <div class="dim" style="font-size:.78rem; margin-top:6px">
       The token is kept in this browser and sent to the server only to verify
       the bot and send a test message or action alert. A server-level
@@ -214,14 +216,94 @@ async function api(path, body, options = {}) {
     headers["X-Tg-Bot-Token"] = S.botToken;
     headers["X-Tg-Bot-Chat-Id"] = S.botChatId;
   }
-  const res = await fetch(path, {
-    method: body == null ? "GET" : "POST",
-    headers,
-    body: body == null ? undefined : JSON.stringify(body),
-  });
+  // A serverless function can hang (cold start, unreachable Bot API host);
+  // never leave a button waiting forever.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || 60000);
+  let res;
+  try {
+    res = await fetch(path, {
+      method: body == null ? "GET" : "POST",
+      headers,
+      body: body == null ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    const timedOut = e && e.name === "AbortError";
+    return {
+      status: 0, data: {}, raw: "", timedOut,
+      networkError: timedOut
+        ? "no answer within " + Math.round((options.timeoutMs || 60000) / 1000) + "s"
+        : (e && e.message) || "network error",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  // Read the body once, as text: an HTML error page (a crashed function, a
+  // proxy login wall, a 404 from an old deployment) must stay reportable.
+  let raw = "";
+  try { raw = await res.text(); } catch (e) { /* no body */ }
   let data = {};
-  try { data = await res.json(); } catch (e) { /* non-JSON response */ }
-  return { status: res.status, data };
+  try { data = JSON.parse(raw); } catch (e) { /* not JSON */ }
+  if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
+  return { status: res.status, data, raw,
+           contentType: res.headers.get("content-type") || "" };
+}
+
+function snippet(raw, limit = 160) {
+  const text = String(raw || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ")
+    .trim();
+  return text.length > limit ? text.slice(0, limit) + "…" : text;
+}
+
+// Turn any /api/bot_connect failure into something actionable.
+function explainBotFailure(result, base = "/api/bot_connect") {
+  const { status, data, raw, networkError, timedOut } = result || {};
+  if (networkError) {
+    return "Could not reach " + base + " (" + networkError + "). " +
+      (timedOut
+        ? "The server took too long — if it is a hosted deployment, check its function logs; " +
+          "if it is a local/sandbox server, Telegram may be unreachable from there."
+        : "The page and the API must come from the same deployment (opening index.html " +
+          "from disk or a static host cannot work). If they do, open " + base +
+          " in a browser tab: a login page or an HTML error there means something sits " +
+          "in front of the API (on Vercel: Deployment Protection) rather than the app.");
+  }
+  if (data && data.error) return data.error;
+  if (status === 401 || status === 403) {
+    return "HTTP " + status + " from " + base + ". If the deployment has " +
+      "ACCESS_TOKEN set, enter it above; on Vercel, Deployment Protection " +
+      "(Vercel Authentication) can also block API calls — disable it or log in. " +
+      (raw ? "Server said: " + snippet(raw) : "");
+  }
+  if (status === 404) {
+    return "HTTP 404: " + base + " does not exist on this deployment. " +
+      "It is probably an old build or a static host — redeploy the current " +
+      "repository (api/bot_connect.py must be deployed) and retry.";
+  }
+  if (status >= 500) {
+    return "HTTP " + status + " from " + base + " — the server function " +
+      "crashed. Check the deployment logs." +
+      (raw ? " Server said: " + snippet(raw) : "");
+  }
+  return "Could not connect the bot. HTTP " + status + " from " + base +
+    (raw ? ": " + snippet(raw) : ".");
+}
+
+// Ask the server (no credentials needed) why connecting fails.
+async function diagnoseBot() {
+  const result = await api("/api/bot_connect", null, { timeoutMs: 20000 });
+  const { status, data } = result;
+  if (status !== 200 || !data || data.endpoint !== "bot_connect") {
+    return explainBotFailure(result) + " (server check)";
+  }
+  const lines = [];
+  lines.push("Server check: Bot API host " + (data.api_base || "?") +
+    " is " + (data.api_host_reachable ? "reachable ✔" : "NOT reachable ✖") +
+    (data.detail ? " (" + data.detail + ")" : ""));
+  (data.hints || []).forEach((h) => lines.push("• " + h));
+  lines.push("• " + data.chat_id_help);
+  return lines.join("\n");
 }
 
 function renderBotStatus(message, cls = "dim") {
@@ -251,30 +333,38 @@ async function connectBot() {
     return renderBotStatus("Enter both the bot token and your Telegram user/chat ID.", "err");
   }
   renderBotStatus("Verifying the token and sending a test alert…");
-  try {
-    const { status, data } = await api("/api/bot_connect", {
-      bot_token: token,
-      chat_id: chatId,
-    });
-    if (status !== 200 || !data.connected) {
-      const previous = S.botToken && S.botChatId
-        ? " The previously saved bot remains active."
-        : "";
-      return renderBotStatus((data.error || "Could not connect the bot.") + previous, "err");
-    }
-    S.botToken = token;
-    S.botChatId = chatId;
-    S.botUsername = (data.bot && data.bot.username) || "";
-    store("tg_bot_token", S.botToken);
-    store("tg_bot_chat_id", S.botChatId);
-    store("tg_bot_username", S.botUsername);
-    const botName = S.botUsername ? "@" + S.botUsername : "your bot";
-    renderBotStatus("Connected to " + botName + "; test alert sent to chat " + chatId +
-      ". This browser will use it for cleanup and guard alerts.", "ok");
-    log("Telegram bot alerts connected as " + botName + " ✔", "ok");
-  } catch (e) {
-    renderBotStatus("Could not reach this server. Check your connection and try again.", "err");
+  const result = await api("/api/bot_connect", {
+    bot_token: token,
+    chat_id: chatId,
+  }, { timeoutMs: 45000 });
+  const { status, data } = result;
+  if (status !== 200 || !data.connected) {
+    const previous = S.botToken && S.botChatId
+      ? " The previously saved bot remains active."
+      : "";
+    let message = explainBotFailure(result) + previous;
+    // No answer from the endpoint itself (HTML error page, 404, timeout):
+    // ask the server for a diagnosis instead of guessing.
+    if (!data.error) message += "\n" + await diagnoseBot();
+    log("Bot connect failed: " + message.replace(/\s*\n\s*/g, " "), "err");
+    return renderBotStatus(message, "err");
   }
+  S.botToken = token;
+  S.botChatId = chatId;
+  S.botUsername = (data.bot && data.bot.username) || "";
+  store("tg_bot_token", S.botToken);
+  store("tg_bot_chat_id", S.botChatId);
+  store("tg_bot_username", S.botUsername);
+  const botName = S.botUsername ? "@" + S.botUsername : "your bot";
+  renderBotStatus("Connected to " + botName + "; test alert sent to chat " + chatId +
+    ". This browser will use it for cleanup and guard alerts.", "ok");
+  log("Telegram bot alerts connected as " + botName + " ✔", "ok");
+}
+
+async function checkBotServer() {
+  renderBotStatus("Checking the server…");
+  const message = await diagnoseBot();
+  renderBotStatus(message, message.includes("NOT reachable") ? "err" : "dim");
 }
 
 function disconnectBot() {

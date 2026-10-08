@@ -16,6 +16,8 @@ from pathlib import Path
 
 from flask import Flask, Response
 
+import api_common
+
 ROOT = Path(__file__).resolve().parent
 
 ENDPOINTS = ("auth_start", "auth_finish", "bot_connect", "dialogs", "clean",
@@ -53,6 +55,10 @@ def home():
 
 for _name in ENDPOINTS:
     mount(load_endpoint(_name), _name)
+
+# The deployed functions answer errors as JSON (see api_common.json_errors);
+# do the same here so a local run behaves exactly like Vercel.
+api_common.json_errors(app)
 
 
 if __name__ == "__main__":

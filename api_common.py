@@ -13,8 +13,10 @@ Handlers return plain dicts / (dict, status) tuples; Flask jsonifies them.
 
 import asyncio
 import os
+import re
 
 from flask import request
+from werkzeug.exceptions import HTTPException
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
@@ -27,6 +29,33 @@ DEFAULT_CHUNK = 200   # messages per /api/clean and /api/wipe call
 MAX_CHUNK = 1000
 DEFAULT_LEAVE = 10    # chats per /api/leave call
 MAX_LEAVE = 100
+
+# Anything shaped like a Bot API token, so error text can never leak one.
+SECRET_RE = re.compile(r"[0-9]{5,}:[A-Za-z0-9_-]{10,}")
+
+
+def redact(text):
+    """Replace anything shaped like a bot token in ``text``."""
+    return SECRET_RE.sub("bot<redacted>", str(text))
+
+
+def json_errors(app):
+    """Make a Flask app answer every error as JSON instead of an HTML page.
+
+    A crashed serverless function otherwise returns the platform's HTML error
+    page, which the web UI can only report as an unexplained failure ("Could
+    not connect the bot."). JSON keeps the real reason visible.
+    """
+    @app.errorhandler(HTTPException)
+    def _http_error(error):
+        return {"error": f"{error.code} {error.name}: {error.description}",
+                "http_status": error.code}, error.code
+
+    @app.errorhandler(Exception)
+    def _unhandled(error):      # pragma: no cover - defensive
+        return {"error": f"server error: {type(error).__name__}: "
+                         f"{redact(error)}", "http_status": 500}, 500
+    return app
 
 
 # --------------------------------------------------------------------------
@@ -160,28 +189,54 @@ def _chunk_params(data):
 # handlers (unit-testable without a Flask request context)
 # --------------------------------------------------------------------------
 
+def _api_base_info():
+    """The configured Bot API root, or None when TELEGRAM_API_BASE is broken."""
+    try:
+        return notify.api_base()
+    except notify.BotAPIError:
+        return None
+
+
+def _with_hint(message, error):
+    """Append the actionable hint for a Bot API rejection, if there is one."""
+    hint = notify.bot_error_hint(error)
+    if not hint:
+        return message
+    return f"{message} {hint[0].upper()}{hint[1:]}."
+
+
 def handle_bot_connect(data):
     """Verify a browser-supplied bot token and deliver a one-time test alert.
 
     Credentials are only used for these two Bot API calls and are never stored
     by the server. The browser may keep them locally after this succeeds.
+
+    Every failure names what went wrong (bad token shape, unreachable Bot API
+    host, chat the bot cannot post to) so the UI never has to guess.
     """
+    if not isinstance(data, dict):
+        return {"error": "the request body must be a JSON object with "
+                         "bot_token and chat_id"}, 400
     token = str(data.get("bot_token") or "").strip()
     chat_id = str(data.get("chat_id") or "").strip()
-    if not token:
-        return {"error": "bot_token is required"}, 400
-    if not notify.valid_bot_token(token):
-        return {"error": "bot token has an invalid format"}, 400
-    if not chat_id:
-        return {"error": "chat_id is required (your Telegram user/chat ID)"}, 400
-    if len(chat_id) > 128 or any(ord(char) < 32 for char in chat_id):
-        return {"error": "chat_id is invalid"}, 400
+    problem = notify.bot_token_problem(token)
+    if problem:
+        return {"error": problem}, 400
+    problem = notify.chat_id_problem(chat_id)
+    if problem:
+        return {"error": problem}, 400
 
+    base = _api_base_info()
     try:
         me = notify.bot_api_call(token, "getMe", timeout=10)
     except notify.BotAPIError as e:
         status = 502 if e.network else 400
-        return {"error": f"Could not verify the bot token: {e}"}, status
+        message = (f"Could not verify the bot token with "
+                   f"{notify.api_host(base)}: {redact(e)}.")
+        if base is None:
+            message += (" Fix TELEGRAM_API_BASE on the server: it must be an "
+                        "absolute http(s) URL.")
+        return {"error": _with_hint(message, e), "api_base": base}, status
     if not isinstance(me, dict):
         return {"error": "Telegram returned an invalid bot profile"}, 502
 
@@ -193,21 +248,75 @@ def handle_bot_connect(data):
         }, timeout=10)
     except notify.BotAPIError as e:
         status = 502 if e.network else 400
-        return {
-            "error": ("The bot token is valid, but Telegram could not deliver "
-                      f"the test message: {e}. For a private chat, open the bot "
-                      "and send /start first, then check the chat ID."),
-        }, status
+        message = ("The bot token is valid, but Telegram could not deliver the "
+                   f"test message to {chat_id}: {redact(e)}.")
+        hint = notify.bot_error_hint(e)
+        message += (f" {hint[0].upper()}{hint[1:]}." if hint else
+                    " For a private chat, open the bot and send /start first, "
+                    "then check the chat ID.")
+        return {"error": message, "api_base": base}, status
 
     return {
         "connected": True,
         "test_message_sent": True,
         "chat_id": chat_id,
+        "api_base": base,
         "bot": {
             "id": me.get("id"),
             "username": me.get("username"),
             "first_name": me.get("first_name"),
         },
+    }
+
+
+def handle_bot_diagnostics():
+    """Diagnose the bot-alert path for ``GET /api/bot_connect``.
+
+    Answers without any credentials, so the web UI (or ``curl``) can tell a
+    misconfigured deployment from a bad token: it reports the Bot API root in
+    use, whether this server can reach it at all, and what else would make a
+    connect attempt fail. Tokens are never returned, only their presence.
+    """
+    env = os.environ
+    base = _api_base_info()
+    reachable, detail = notify.probe_api_base(base, timeout=5)
+    access_token = bool((env.get("ACCESS_TOKEN") or "").strip())
+    notify_on = (env.get("TELEGRAM_NOTIFY") or "1").strip().lower() \
+        not in notify.FALSEY
+    server_bot = bool((env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+                      and (env.get("TELEGRAM_CHAT_ID") or "").strip())
+
+    hints = []
+    if base is None:
+        hints.append("TELEGRAM_API_BASE is not a valid absolute http(s) URL — "
+                     "fix it on the deployment or remove it.")
+    if not reachable:
+        hints.append(
+            f"This server cannot reach the Bot API host "
+            f"{notify.api_host(base)}. Hosted deployments such as Vercel "
+            "normally can; sandboxes, some corporate networks and firewalls "
+            "block api.telegram.org. Point TELEGRAM_API_BASE at a reachable "
+            "Bot API server (or set HTTPS_PROXY) and retry.")
+    if access_token:
+        hints.append("This deployment requires ACCESS_TOKEN: paste that value "
+                     "in the Access token field before connecting the bot.")
+    if not notify_on:
+        hints.append("TELEGRAM_NOTIFY=0 on the server: automatic alerts stay "
+                     "muted (the test alert from this card is still sent).")
+
+    return {
+        "endpoint": "bot_connect",
+        "api_base": base,
+        "api_host": notify.api_host(base) if base else None,
+        "api_host_reachable": reachable,
+        "detail": detail,
+        "chat_id_help": ("Use your numeric user ID from @userinfobot "
+                         "(never your phone number), a negative supergroup ID, "
+                         "or @channelusername for a public channel."),
+        "server_bot_configured": server_bot,
+        "access_token_required": access_token,
+        "notify_enabled": notify_on,
+        "hints": hints,
     }
 
 
