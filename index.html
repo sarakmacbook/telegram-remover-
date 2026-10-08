@@ -79,7 +79,12 @@
     <label>Bot API token</label>
     <input id="botToken" type="password" autocomplete="off" placeholder="123456789:AA...">
     <label>Your Telegram user/chat ID (Bot API chat_id)</label>
-    <input id="botChatId" inputmode="decimal" autocomplete="off" placeholder="123456789 or -1001234567890">
+    <input id="botChatId" inputmode="text" autocomplete="off" placeholder="123456789, -1001234567890 or @channel">
+    <div class="dim" style="font-size:.78rem; margin-top:5px">
+      This is not your phone number. For private alerts, use your numeric user ID
+      (find it with <a href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a>);
+      group IDs are usually negative. Add the bot to a group before using its ID.
+    </div>
     <div class="row" style="margin-top:10px">
       <button onclick="connectBot()">Connect &amp; send test alert</button>
       <button class="ghost" onclick="disconnectBot()">Disconnect / forget</button>
@@ -236,6 +241,10 @@ function renderBotStatus(message, cls = "dim") {
 }
 
 async function connectBot() {
+  // Bot setup is independent of account login, so honor a newly entered
+  // deployment access token even when Send login code has not been clicked.
+  S.accessToken = $("accessToken").value.trim();
+  store("tg_access_token", S.accessToken);
   const token = $("botToken").value.trim();
   const chatId = $("botChatId").value.trim();
   if (!token || !chatId) {

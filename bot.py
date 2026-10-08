@@ -61,7 +61,10 @@ class BotError(Exception):
 
 def api_call(token, method, params=None, timeout=POLL_TIMEOUT):
     """One Bot API call. Returns the ``result`` field or raises BotError."""
-    url = f"{notify.API_BASE}/bot{token}/{method}"
+    try:
+        url = f"{notify.api_base()}/bot{token}/{method}"
+    except notify.BotAPIError as e:
+        raise BotError(f"{method}: {e}") from e
     request = urllib.request.Request(
         url, data=json.dumps(params or {}).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
