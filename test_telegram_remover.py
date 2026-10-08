@@ -184,7 +184,7 @@ class TestGuardCommand(unittest.IsolatedAsyncioTestCase):
         tr.connect = fake_connect
         out = io.StringIO()
         try:
-            args = tr.build_parser().parse_args(["guard"] + argv)
+            args = tr.build_parser().parse_args(["--no-db", "guard"] + argv)
             with contextlib.redirect_stdout(out):
                 await tr.cmd_guard(args)
         finally:

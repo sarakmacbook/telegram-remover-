@@ -39,8 +39,10 @@
   <h1>telegram<span>-remover</span></h1>
   <div class="card warn">⚠️ This tool acts on <b>your own</b> Telegram account and
   everything it does is <b>irreversible</b>. Your session is stored in
-  <b>this browser only</b> (localStorage) — nothing is kept on the server.
-  Only use a deployment you trust.</div>
+  <b>this browser only</b> (localStorage). If the server has
+  <code>DATABASE_URL</code> set, only the guard/cleanup <b>history</b> is kept
+  in its SQL database (auto-purged every month). Only use a deployment you
+  trust.</div>
 
   <div class="card" id="loginCard">
     <h2>Connect</h2>
@@ -118,6 +120,21 @@
       </div>
       <div id="guardState" class="dim" style="margin-top:8px">Idle.</div>
     </div>
+  </div>
+
+  <div class="card" id="historyCard">
+    <div class="row">
+      <h2 style="flex:1">Database history <span class="kind">SQL</span></h2>
+      <button class="ghost" onclick="loadHistory()">Refresh</button>
+    </div>
+    <div class="dim" style="font-size:.85rem; margin-bottom:6px">
+      When the server has <code>DATABASE_URL</code> set (SQLite, PostgreSQL or
+      MySQL), every guard decision and cleanup run is stored here and purged
+      after a month. Run the companion bot (<code>python bot.py</code>) to get
+      alerts and use <code>/status</code>, <code>/recent</code> and
+      <code>/pause</code> from Telegram.
+    </div>
+    <div id="history" class="dim">Not loaded yet.</div>
   </div>
 
   <div class="card">
@@ -472,11 +489,50 @@ async function deleteAccount() {
   }
 }
 
+// ------------------------------------------------------- database history --
+async function loadHistory() {
+  const el = $("history");
+  const { status, data } = await api("/api/events?limit=15", null);
+  if (status !== 200 || !data.enabled) {
+    el.className = "dim";
+    el.textContent = "Not stored server-side" +
+      (data.reason ? " — " + data.reason : " (set DATABASE_URL on the server).");
+    return;
+  }
+  const s = data.stats || {};
+  const lines = [];
+  if (data.paused) lines.push("⏸ Guard is PAUSED via the Telegram bot (/resume to continue).");
+  lines.push(`Database ${s.url || "?"} — ${s.events ?? 0} event(s), ` +
+             `${s.runs ?? 0} run(s), kept ${data.retention_days ?? 30} days.`);
+  lines.push("");
+  lines.push("— recent guard events —");
+  (data.events || []).forEach((e) => {
+    const who = e.user_label || (e.user_id ? "id " + e.user_id : "—");
+    const chat = e.chat_label || e.chat_key || "?";
+    lines.push(`[${e.time || "?"}] ${chat}: ${who} — ${e.status || "?"}` +
+               (e.reason ? ` (${e.reason})` : ""));
+  });
+  if (!(data.events || []).length) lines.push("  (none yet)");
+  lines.push("");
+  lines.push("— recent cleanup runs —");
+  (data.runs || []).forEach((r) => {
+    lines.push(`[${r.time || "?"}] ${r.action} — ${r.status || "?"}` +
+               (r.chat ? ` in ${r.chat}` : ""));
+  });
+  if (!(data.runs || []).length) lines.push("  (none yet)");
+  el.className = "";
+  el.style.fontFamily = "ui-monospace, monospace";
+  el.style.fontSize = ".78rem";
+  el.style.whiteSpace = "pre-wrap";
+  el.textContent = lines.join("\n");
+}
+
 if (S.session) {
   $("loginCard").classList.add("hidden");
   $("main").classList.remove("hidden");
   loadChats();
 }
+loadHistory();
 </script>
 </body>
 </html>

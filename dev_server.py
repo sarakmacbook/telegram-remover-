@@ -19,7 +19,7 @@ from flask import Flask, Response
 ROOT = Path(__file__).resolve().parent
 
 ENDPOINTS = ("auth_start", "auth_finish", "dialogs", "clean", "wipe", "leave",
-             "guard", "delete_account", "index")
+             "guard", "delete_account", "events", "index")
 
 app = Flask(__name__)
 

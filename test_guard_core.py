@@ -581,6 +581,38 @@ class TestGuardActions(GuardCase):
 # batch scanning (the web path) and preview
 # --------------------------------------------------------------------------
 
+class TestRemotePause(GuardCase):
+    """The Telegram bot's /pause kill switch (pause_check callback)."""
+
+    async def test_pause_check_holds_live_actions(self):
+        client = FakeClient(users=[user(42), user(43)], admins=[7])
+        entity = supergroup()
+        paused = {"value": True}
+        g = self.build(guard.GuardPolicy(), dry_run=False, armed={"delete"},
+                       pause_check=lambda: paused["value"])
+        await g.prepare(client, entity)
+
+        rec = (await g.handle(client, entity, self.join(mid=99, uid=42)))[0]
+        self.assertEqual(rec["status"], "paused")
+        self.assertIn("Telegram bot", rec["reason"])
+        self.assertEqual(client.deleted_batches, [])   # nothing deleted
+
+        paused["value"] = False
+        rec = (await g.handle(client, entity, self.join(mid=98, uid=43)))[0]
+        self.assertEqual(rec["status"], "acted")
+        self.assertEqual(client.deleted_batches, [(entity, [98], True)])
+
+    async def test_dry_run_reports_even_while_paused(self):
+        client = FakeClient(users=[user(42)], admins=[7])
+        entity = supergroup()
+        g = self.build(guard.GuardPolicy(), dry_run=True, armed={"delete"},
+                       pause_check=lambda: True)
+        await g.prepare(client, entity)
+        rec = (await g.handle(client, entity, self.join()))[0]
+        self.assertEqual(rec["status"], "dry_run")
+        self.assertEqual(client.deleted_batches, [])
+
+
 class TestGuardScan(GuardCase):
     def messages(self):
         return [

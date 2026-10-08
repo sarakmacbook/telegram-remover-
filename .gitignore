@@ -5,6 +5,11 @@
 *.session
 *.session-journal
 
+# local SQL history database (db.py)
+*.db
+*.sqlite
+*.sqlite3
+
 # python
 __pycache__/
 .venv/

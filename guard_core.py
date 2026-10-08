@@ -614,7 +614,7 @@ class JoinGuard:
 
     def __init__(self, policy, dry_run=True, armed=(), now=time.time,
                  limiter=None, audit_path=None, on_record=None, verbose=True,
-                 sleep=True):
+                 sleep=True, pause_check=None):
         self.policy = policy
         self.dry_run = bool(dry_run)
         self.armed = {a for a in armed if a in ACTIONS}
@@ -622,6 +622,8 @@ class JoinGuard:
         self.sleep = bool(sleep)
         self.audit_path = audit_path
         self.on_record = on_record
+        self.pause_check = pause_check   # callable -> bool (e.g. the Telegram
+                                         # bot's /pause flag in the database)
         self.records = []
         self.limiter = limiter if limiter is not None else RateLimiter(
             policy.max_actions_per_hour, now=now)
@@ -739,6 +741,15 @@ class JoinGuard:
         if reason:
             record["status"] = "protected"
             record["reason"] = f"{reason} is never touched"
+            return self._finish(record)
+
+        # A remote kill switch (the Telegram bot's /pause, shared through the
+        # SQL database) holds every live action. Dry runs and previews are
+        # read-only, so they keep reporting what would happen.
+        if not dry_run and not preview and self.pause_check and self.pause_check():
+            record["status"] = "paused"
+            record["reason"] = ("paused remotely (Telegram bot /pause) — "
+                                "send /resume to continue")
             return self._finish(record)
 
         user = await resolve_input_user(client, uid, info.get("message"))

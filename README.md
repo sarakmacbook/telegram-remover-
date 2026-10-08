@@ -14,6 +14,16 @@ Both can:
 | `leave-all` / "Leave ALL" | Every **group and channel** you joined (with a keep-list) |
 | `guard` / "Join guard" | Auto-mod: deletes the "X joined the group" message and (opt-in, with a typed confirmation) removes or bans the joiner |
 | `delete-account` / "Delete my account" | Your **entire Telegram account**, permanently |
+| `db` | Inspect / purge the **SQL history database** (guard decisions, cleanup runs) |
+
+Two optional add-ons turn it into a proper little platform (see below):
+
+* **SQL history database** (`db.py`) — every guard decision, cleanup run,
+  allow-list and cursor is stored in **SQLite / PostgreSQL / MySQL** and
+  purged automatically every month.
+* **Telegram bot** (`bot.py` + `notify.py`) — alerts for guard actions and
+  cleanup runs, plus `/status`, `/recent`, `/pause` (kill switch) etc. from
+  any device.
 
 > ⚠️ Everything this tool does is **irreversible**. The CLI is a **dry run**
 > unless you pass `--yes`; the web UI asks for confirmation before each action.
@@ -84,6 +94,13 @@ python telegram_remover.py guard --chat @mygroup --yes --ban-joiner --ban-hours 
 
 # 💀 the nuclear option: delete your account forever
 python telegram_remover.py delete-account --yes      # you must also type DELETE
+
+# 🗄 the SQL history database (on by default — sqlite:///telegram_remover.db)
+python telegram_remover.py db status                 # what is stored
+python telegram_remover.py db events -n 20           # recent guard decisions
+python telegram_remover.py db runs                   # recent cleanup runs
+python telegram_remover.py db purge                  # monthly cleanup, now
+python telegram_remover.py --no-db wipe @chat --yes  # skip the database once
 ```
 
 ## The join guard (auto-mod)
@@ -161,6 +178,11 @@ Python serverless functions (`api/*.py`). Click the button:
    - `ACCESS_TOKEN` — if set, every request must send it as `X-Access-Token`.
      Use this to password-protect your deployment.
    - `API_ID` / `API_HASH` — if not set, you enter them in the web UI instead.
+   - `DATABASE_URL` — store guard/cleanup history in SQL (SQLite / Postgres /
+     MySQL) and let the companion bot report on it. Without it the deployment
+     stores nothing server-side.
+   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — push alerts about guard
+     actions and cleanups to your phone (see the bot section below).
 3. Open the deployment URL, log in with your phone number (Telegram sends you
    a code), and clean away.
 
@@ -171,8 +193,9 @@ joins that arrived since the last one. Press **Guard** next to a group, choose
 the actions, then *Start dry run* or *Start LIVE*. Live kick/ban asks you to
 type the confirmation phrase, the server refuses requests without it, and the
 guard disarms itself when the circuit breaker trips. The audit trail scrolls in
-the Log panel. Nothing about the guard is stored server-side — the cursor and
-the browser log live in your browser, like the session itself.
+the Log panel. Without a database, nothing about the guard is stored
+server-side — the cursor and the browser log live in your browser, like the
+session itself (set `DATABASE_URL` to also keep the history in SQL, below).
 
 Want to try the UI before deploying? `python dev_server.py` serves the same
 page and the same `/api/*` endpoints locally (`HOST=0.0.0.0 PORT=8000` to
@@ -185,6 +208,74 @@ chats per call) and the UI polls until done, so they work within Vercel's
 function time limits (`maxDuration: 60` in `vercel.json`; raise it if you're
 on a paid plan). Flood limits are surfaced to the UI, which waits and retries.
 
+## SQL history database (optional)
+
+`db.py` stores everything the tool does in a SQL database — any
+[SQLAlchemy](https://www.sqlalchemy.org/) URL works:
+
+| Engine | `DATABASE_URL` |
+|---|---|
+| SQLite (default) | `sqlite:///telegram_remover.db` (a local file) |
+| PostgreSQL | `postgresql://user:pass@host/db` (Vercel Postgres, Neon, ...) |
+| MySQL | `mysql://user:pass@host/db` (PlanetScale, ...) |
+
+What lands in there:
+
+* **events** — every join-guard decision (join, acted, protected, paused,
+  error) with who/where/what, from the CLI *and* the web UI
+* **runs** — cleanup history: `clean-messages`, `wipe`, `leave-all`,
+  `delete-account`, guard sessions, with counts
+* **kv** — small shared state: the bot's pause flag, live guard status,
+  allow-lists, cursors
+
+**Monthly cleanup:** rows older than `DB_RETENTION_DAYS` (default **30**)
+are deleted automatically every time the database is opened, so it never
+grows forever — "store everything, remove everything every month".
+`python telegram_remover.py db purge` and the bot's `/purge` do the same
+on demand (add `--all` to also drop old kv config).
+
+The CLI records by default (SQLite file next to the commands); turn it off
+per run with `--no-db`, or point it at a server with `--db postgresql://...`
+or `DATABASE_URL`. The web UI records **only** when `DATABASE_URL` is set —
+without it the deployment stays fully stateless, exactly as before. Either
+way a database problem can never break a cleanup: storage is best effort.
+
+The web UI shows what is stored in its **Database history** card
+(`GET /api/events`), and `python telegram_remover.py db status|events|runs`
+shows the same from a terminal.
+
+## Telegram bot: alerts + status commands (optional)
+
+The Bot API cannot read your chats or delete anything — that stays the user
+session's job — but it is perfect for **alerts and remote control**:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather), put the token in
+   `TELEGRAM_BOT_TOKEN`.
+2. Send that bot any message and run `python bot.py` — it prints your chat
+   id. Put it in `TELEGRAM_CHAT_ID` (comma-separated for several admins) and
+   restart the bot.
+
+Now you get, in that chat:
+
+* **Alerts** from the CLI and the web UI: every guard action, circuit-breaker
+  pause and cleanup summary (`TELEGRAM_NOTIFY=0` keeps the bot silent).
+* **Commands** — the bot shares state with the guard through the SQL database:
+
+| Command | What it does |
+|---|---|
+| `/status` | guard mode, last decision, circuit breaker, database stats |
+| `/recent [n]` | the last n guard decisions |
+| `/runs [n]` | the last n cleanup runs |
+| `/pause` | **kill switch** — every running guard holds all actions |
+| `/resume` | let the guards act again |
+| `/purge [days]` | delete records older than the retention window, now |
+| `/db` | database statistics |
+
+`/pause` is the one to remember: typed from your phone, it stops a running
+guard (CLI *or* web) from deleting anything or touching anyone until
+`/resume` — independent of the circuit breaker. Commands only work in the
+chats listed in `TELEGRAM_CHAT_ID`; everybody else is ignored.
+
 ## Safety features
 
 - CLI: dry run by default; `--yes` required to actually delete.
@@ -193,6 +284,10 @@ on a paid plan). Flood limits are surfaced to the UI, which waits and retries.
   confirmation box — the server rejects `/api/guard` without it), admins and
   the allow-list are protected, and the circuit breaker pauses the guard after
   30 member actions an hour instead of mass-banning.
+- The companion bot's `/pause` is a **kill switch** shared through the SQL
+  database: it holds every running guard (CLI and web) from deleting or
+  removing anything until `/resume` — handy when you are away from the
+  keyboard and something looks wrong.
 - `delete-account` additionally requires typing `DELETE` (CLI) or typing
   `DELETE` into a prompt (web).
 - Messages are deleted in batches of 100 (Telegram's per-call limit).
@@ -212,6 +307,10 @@ telegram_remover.py   CLI (argparse) — thin wrapper over remover_core + guard_
 remover_core.py       shared async logic: chunked sweeps, leave, delete-account
 guard_core.py         the join guard: join detection, policy, confirmation,
                       rate limiting, kick/ban/purge, resumable cursor scans
+db.py                 SQL storage (SQLite/PostgreSQL/MySQL): events, runs, kv,
+                      monthly auto-purge
+notify.py             Telegram Bot API alerts (stdlib urllib, best effort)
+bot.py                companion bot: /status /recent /runs /pause /purge /db
 api_common.py         request helpers + handlers for the serverless endpoints
 api/*.py              one Vercel Python function per endpoint (Flask WSGI)
 index.html            the web UI (vanilla JS, no build step)

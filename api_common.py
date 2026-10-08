@@ -17,13 +17,61 @@ from flask import request
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
+import db
 import guard_core
+import notify
 import remover_core
 
 DEFAULT_CHUNK = 200   # messages per /api/clean and /api/wipe call
 MAX_CHUNK = 1000
 DEFAULT_LEAVE = 10    # chats per /api/leave call
 MAX_LEAVE = 100
+
+
+# --------------------------------------------------------------------------
+# SQL storage + Telegram notifications (optional, best effort)
+# --------------------------------------------------------------------------
+
+def _store():
+    """The SQL store (set DATABASE_URL to enable), or None. Never raises."""
+    try:
+        return db.get_store()
+    except Exception:  # noqa: BLE001 — storage must never break an API call
+        return None
+
+
+def _notifier():
+    try:
+        return notify.Notifier.from_env()
+    except Exception:  # noqa: BLE001
+        return notify.Notifier("", "")
+
+
+def _record_run(action, summary, status="done", chat=None, details=None):
+    """Store one cleanup run and push a Telegram summary (best effort)."""
+    store, notifier = _store(), _notifier()
+    if store is not None:
+        try:
+            store.record_run(action, status=status, chat=chat, details=details,
+                             source="web")
+        except Exception:  # noqa: BLE001
+            pass
+    notifier.send_run(action, summary)
+
+
+def _record_guard(records):
+    """Store guard audit records and push alerts for the loud ones."""
+    store, notifier = _store(), _notifier()
+    for record in records or []:
+        if record.get("preview"):
+            continue    # previews decide nothing real
+        if store is not None:
+            try:
+                store.record_guard(record, source="web")
+            except Exception:  # noqa: BLE001
+                pass
+        if record.get("status") != "ignored":
+            notifier.send_guard(record)
 
 
 # --------------------------------------------------------------------------
@@ -212,7 +260,16 @@ def handle_clean(data, headers):
         return await remover_core.sweep_chunk(client, entity, limit, cursor,
                                               from_user=me, sleep=False)
 
-    return _exec(session, api_id, api_hash, work)
+    result = _exec(session, api_id, api_hash, work)
+    if isinstance(result, dict):
+        _record_run("clean-messages",
+                    f"deleted {result.get('deleted', 0)} message(s) in {chat}"
+                    + (f" ({result.get('failed', 0)} failed)"
+                       if result.get("failed") else ""),
+                    status="done", chat=chat,
+                    details={k: result.get(k) for k in
+                             ("processed", "deleted", "failed", "done")})
+    return result
 
 
 def handle_wipe(data, headers):
@@ -235,7 +292,16 @@ def handle_wipe(data, headers):
         return await remover_core.sweep_chunk(client, entity, limit, cursor,
                                               from_user=None, sleep=False)
 
-    return _exec(session, api_id, api_hash, work)
+    result = _exec(session, api_id, api_hash, work)
+    if isinstance(result, dict):
+        _record_run("wipe",
+                    f"wiped {result.get('deleted', 0)} message(s) of {chat}"
+                    + (f" ({result.get('failed', 0)} failed)"
+                       if result.get("failed") else ""),
+                    status="done", chat=chat,
+                    details={k: result.get(k) for k in
+                             ("processed", "deleted", "failed", "done")})
+    return result
 
 
 def handle_leave(data, headers):
@@ -262,7 +328,15 @@ def handle_leave(data, headers):
         return await remover_core.leave_chats(client, keep_ids, limit=limit,
                                               me=me, sleep=False)
 
-    return _exec(session, api_id, api_hash, work)
+    result = _exec(session, api_id, api_hash, work)
+    if isinstance(result, dict):
+        _record_run("leave-all",
+                    f"left {result.get('left', 0)} chat(s)"
+                    + (f" ({result.get('failed', 0)} failed)"
+                       if result.get("failed") else ""),
+                    status="done",
+                    details={k: result.get(k) for k in ("left", "failed", "done")})
+    return result
 
 
 def handle_guard(data, headers):
@@ -316,6 +390,20 @@ def handle_guard(data, headers):
     dry_run = bool(data.get("dry_run", True))
     preview = bool(data.get("preview", False))
 
+    # Remote kill switch: the companion bot's /pause is stored in the SQL
+    # database and holds every live action until /resume.
+    store = _store()
+    if store is not None and not dry_run and not preview:
+        try:
+            if store.kv_get("guard:paused"):
+                return {
+                    "error": ("the guard is paused (Telegram bot /pause) — "
+                              "send /resume in the bot first"),
+                    "paused": True,
+                }, 409
+        except Exception:  # noqa: BLE001
+            pass
+
     policy = guard_core.GuardPolicy(
         delete_join_message=bool(data.get("delete_join_message", True)),
         remove_joiner=bool(data.get("remove_joiner")),
@@ -341,8 +429,9 @@ def handle_guard(data, headers):
 
     async def work(client):
         entity = await remover_core.resolve_entity(client, chat)
-        join_guard = guard_core.JoinGuard(policy, dry_run=dry_run or preview,
-                                          armed=armed, sleep=False)
+        join_guard = guard_core.JoinGuard(
+            policy, dry_run=dry_run or preview, armed=armed, sleep=False,
+            pause_check=lambda: bool(store and store.kv_get("guard:paused")))
         await join_guard.prepare(client, entity)
         result = await join_guard.scan(client, entity, cursor=cursor, scan=scan,
                                        max_actions=max_actions, preview=preview)
@@ -355,6 +444,22 @@ def handle_guard(data, headers):
         return result
     result["policy"] = policy.to_dict()
     result["confirmation"] = confirmation
+
+    # Mirror everything into the SQL database (events, cursor, status) so the
+    # companion bot's /status, /recent and /pause work across machines.
+    _record_guard(result.get("records"))
+    if store is not None and not preview:
+        try:
+            store.kv_set(f"guard:cursor:{chat}", result.get("next_cursor"))
+            store.kv_set("guard:status", {
+                "mode": "dry run" if dry_run else "LIVE",
+                "chats": [chat],
+                "source": "web (polling)",
+                "last_scan": result.get("scanned"),
+                "summary": result.get("summary"),
+            })
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
@@ -372,4 +477,36 @@ def handle_delete_account(data, headers):
         await remover_core.delete_account(client, reason, sleep=False)
         return {"deleted": True}
 
-    return _exec(session, api_id, api_hash, work)
+    result = _exec(session, api_id, api_hash, work)
+    if isinstance(result, dict) and result.get("deleted"):
+        _record_run("delete-account",
+                    "account permanently deleted", status="done")
+    return result
+
+
+def handle_events(data):
+    """GET history from the SQL database (guard events + cleanup runs).
+
+    ``{"enabled": false}`` when the server has no ``DATABASE_URL`` — nothing
+    is stored server-side in that case (by design, see README).
+    """
+    store = _store()
+    if store is None:
+        return {
+            "enabled": False,
+            "reason": ("set DATABASE_URL (any SQLAlchemy URL — SQLite, "
+                       "PostgreSQL or MySQL) to store history server-side"),
+        }
+    try:
+        limit = int(data.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+    return {
+        "enabled": True,
+        "retention_days": store.retention_days,
+        "stats": store.stats(),
+        "events": store.list_events(limit=limit),
+        "runs": store.list_runs(limit=limit),
+        "paused": bool(store.kv_get("guard:paused")),
+    }
