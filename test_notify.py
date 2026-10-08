@@ -5,8 +5,10 @@ Run with:  python -m unittest discover -v
 
 import io
 import json
+import os
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 import notify
 
@@ -49,6 +51,20 @@ class TestBotApiCall(NotifyCase):
         self.assertIn("/botTOKEN/getMe", url)
         self.assertEqual(payload, {"sample": True})
         self.assertEqual(timeout, 10)
+
+    def test_custom_bot_api_host_is_used(self):
+        with patch.dict(os.environ, {
+                "TELEGRAM_API_BASE": "https://bot-api.example/base/"}):
+            notify.bot_api_call("TOKEN", "getMe")
+        self.assertEqual(self.sent[0][0],
+                         "https://bot-api.example/base/botTOKEN/getMe")
+
+    def test_invalid_bot_api_host_is_rejected_without_a_request(self):
+        with patch.dict(os.environ, {"TELEGRAM_API_BASE": "not-a-url"}):
+            with self.assertRaises(notify.BotAPIError) as raised:
+                notify.bot_api_call("TOKEN", "getMe")
+        self.assertIn("TELEGRAM_API_BASE", str(raised.exception))
+        self.assertEqual(self.sent, [])
 
     def test_telegram_error_description_is_reported_without_url(self):
         def not_ok(request, timeout=None):

@@ -3,7 +3,10 @@
 Run with:  python -m unittest discover -v
 """
 
+import io
+import os
 import unittest
+from unittest.mock import patch
 
 import bot as companion
 import db
@@ -111,6 +114,17 @@ class TestDisabledStore(BotCase):
 
 
 class TestHelpers(unittest.TestCase):
+    def test_api_call_uses_custom_bot_api_host(self):
+        response = io.BytesIO(b'{"ok": true, "result": []}')
+        with patch.dict(os.environ, {
+                "TELEGRAM_API_BASE": "https://bot-api.example"}):
+            with patch("bot.urllib.request.urlopen", return_value=response) as call:
+                result = companion.api_call("TOKEN", "getUpdates")
+        self.assertEqual(result, [])
+        request = call.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         "https://bot-api.example/botTOKEN/getUpdates")
+
     def test_command_of(self):
         self.assertEqual(companion.command_of(msg("/recent 10")), ("recent", "10"))
         self.assertEqual(companion.command_of(msg("/status@bot")), ("status", ""))

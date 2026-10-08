@@ -41,6 +41,22 @@ class BotConnectTests(unittest.TestCase):
         self.assertIn("test alert", call.call_args_list[1].args[2]["text"])
 
     @patch("api_common.notify.bot_api_call")
+    def test_accepts_group_ids_and_public_channel_usernames(self, call):
+        for chat_id in ("-1001234567890", "@mychannel"):
+            call.reset_mock()
+            call.side_effect = [
+                {"id": 123456789, "username": "alert_bot"},
+                {"message_id": 1},
+            ]
+            result = api_common.handle_bot_connect({
+                "bot_token": VALID_TOKEN,
+                "chat_id": chat_id,
+            })
+            self.assertTrue(result["connected"])
+            self.assertEqual(result["chat_id"], chat_id)
+            self.assertEqual(call.call_args_list[1].args[2]["chat_id"], chat_id)
+
+    @patch("api_common.notify.bot_api_call")
     def test_rejects_malformed_token_before_calling_telegram(self, call):
         result, status = api_common.handle_bot_connect({
             "bot_token": "not/a/token",

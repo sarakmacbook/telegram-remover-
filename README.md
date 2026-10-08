@@ -184,6 +184,10 @@ Python serverless functions (`api/*.py`). Click the button:
    - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — default alerts for CLI and
      web actions (see below). In the web UI, you can connect a browser-specific
      bot instead without setting these environment variables.
+   - `TELEGRAM_API_BASE` — optional Bot API root for a custom/self-hosted
+     Telegram Bot API server; defaults to `https://api.telegram.org`. It must
+     be reachable from the deployment (a local `localhost` is not reachable
+     from Vercel).
 3. Open the deployment URL, log in with your phone number (Telegram sends you
    a code), and clean away.
 
@@ -258,16 +262,24 @@ choose **Connect & send test alert**. The UI verifies the bot with `getMe`,
 sends a test message, and saves the token/ID in that browser only. Subsequent
 web cleanup and guard requests use those values for alerts; they are not
 saved by the server. `TELEGRAM_NOTIFY=0` still disables automatic alerts.
-For private alerts, message your bot with `/start` first. This connection only
-sends notifications — personal-account actions still
-require the phone-based user session above. To use alerts from the CLI or run
-the companion command bot, configure the server/CLI environment as below.
+For private alerts, message your bot with `/start` first. The chat ID is not
+your phone number: use your numeric user ID (for example, from
+[@userinfobot](https://t.me/userinfobot)); group/supergroup IDs are usually
+negative, and the bot must be a member of that group. Public channel usernames
+such as `@mychannel` are also accepted by Telegram. If the deployment has
+`ACCESS_TOKEN` enabled, enter it in the web UI before connecting the bot. This
+connection only sends notifications — personal-account actions still require
+the phone-based user session above. To use alerts from the CLI or run the
+companion command bot, configure the server/CLI environment as below.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), put the token in
    `TELEGRAM_BOT_TOKEN`.
 2. Send that bot any message and run `python bot.py` — it prints your chat
    id. Put it in `TELEGRAM_CHAT_ID` (comma-separated for several admins) and
-   restart the bot.
+   restart the bot. Group/supergroup IDs are negative (commonly `-100…`).
+3. (Optional) Set `TELEGRAM_API_BASE` to the root URL of a custom/self-hosted
+   Bot API server. It defaults to `https://api.telegram.org` and is used by
+   both the web UI and companion bot.
 
 Now you get, in that chat:
 

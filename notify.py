@@ -5,6 +5,8 @@ Configure with two environment variables (e.g. in ``.env``):
 * ``TELEGRAM_BOT_TOKEN`` — the token @BotFather gave your bot
 * ``TELEGRAM_CHAT_ID``   — the chat that should receive the alerts
                            (your own user id, or a group the bot is in)
+* ``TELEGRAM_API_BASE``  — optional custom Bot API root; defaults to
+                           ``https://api.telegram.org``
 
 ``TELEGRAM_NOTIFY=0`` keeps the bot silent while everything else still works.
 The web UI can instead provide a bot token and chat ID from its Telegram bot
@@ -22,6 +24,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 API_BASE = "https://api.telegram.org"
 MAX_LEN = 4096          # Telegram's message length limit
@@ -43,6 +46,33 @@ def valid_bot_token(token):
     return len(token) <= 256 and bool(BOT_TOKEN_RE.fullmatch(token))
 
 
+def api_base(environ=None):
+    """Return the configured Bot API root, defaulting to Telegram's hosted API.
+
+    ``TELEGRAM_API_BASE`` is useful when the app's server must use a custom or
+    self-hosted Bot API endpoint. It is read at call time so values loaded from
+    a local ``.env`` file after module import are honored too.
+    """
+    env = os.environ if environ is None else environ
+    base = str(env.get("TELEGRAM_API_BASE") or API_BASE).strip().rstrip("/")
+    if not base:
+        base = API_BASE
+    try:
+        parsed = urlsplit(base)
+        hostname = parsed.hostname
+        _ = parsed.port  # force validation of an explicitly supplied port
+    except ValueError as e:
+        raise BotAPIError(
+            "TELEGRAM_API_BASE must be an absolute HTTP(S) URL without credentials, "
+            "a query, or a fragment") from e
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise BotAPIError(
+            "TELEGRAM_API_BASE must be an absolute HTTP(S) URL without credentials, "
+            "a query, or a fragment")
+    return base
+
+
 def bot_api_call(token, method, params=None, timeout=10):
     """Call one Telegram Bot API method, returning ``result`` or raising.
 
@@ -50,7 +80,7 @@ def bot_api_call(token, method, params=None, timeout=10):
     """
     if not token or not method:
         raise BotAPIError("bot token and method are required")
-    url = f"{API_BASE}/bot{token}/{method}"
+    url = f"{api_base()}/bot{token}/{method}"
     request = urllib.request.Request(
         url, data=json.dumps(params or {}).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
