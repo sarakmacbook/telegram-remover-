@@ -191,6 +191,13 @@ Python serverless functions (`api/*.py`). Click the button:
 3. Open the deployment URL, log in with your phone number (Telegram sends you
    a code), and clean away.
 
+**Keep the Framework Preset on *Other*.** `vercel.json` sets `"framework": null`,
+which makes Vercel deploy every `api/*.py` as its own endpoint. Do not switch the
+project to the Flask preset: Vercel would then send every `/api/*` request into
+`api/index.py`, so `/api/auth_start`, `/api/bot_connect` and the rest return 404.
+If the project settings still show Flask after you redeploy, set *Framework
+Preset* to **Other** and redeploy.
+
 **Deployment Protection.** If the project keeps *Settings → Deployment
 Protection → Vercel Authentication* enabled, only browsers logged in to Vercel
 can load the page **and** call `/api/*`; everything else (your phone, `curl`,
@@ -290,10 +297,15 @@ can reach it, and what would stop a connect attempt. The usual causes:
   deployments such as Vercel can reach it; anywhere else point
   `TELEGRAM_API_BASE` at a reachable Bot API server or provide an
   `HTTPS_PROXY` for the process.
-* **A stale build or a static host.** `POST /api/bot_connect` must exist on the
-  deployment that served `index.html` (a 404 means the old build is still
-  live — redeploy). The API also answers JSON, not HTML: if the error mentions
-  "HTTP 500" or an HTML page, read the function logs.
+* **A stale build, a static host, or the wrong Framework Preset.**
+  `POST /api/bot_connect` must exist on the deployment that served `index.html`.
+  A 404 means the API is not being served there: an old build is still live
+  (redeploy), the page comes from a static host with no functions, or the
+  project's Framework Preset is Flask. With Flask, Vercel routes every `/api/*`
+  request into `api/index.py` and the other endpoints 404. `vercel.json` pins the
+  Other preset (`"framework": null`), so redeploying the current repository fixes
+  it. The API also answers JSON, not HTML: if the error mentions "HTTP 500" or an
+  HTML page, read the function logs.
 * **Vercel Deployment Protection.** With *Vercel Authentication* enabled,
   every request — including `fetch()` calls from the page — must carry a
   Vercel login, so the UI cannot reach the API. Turn it off under
