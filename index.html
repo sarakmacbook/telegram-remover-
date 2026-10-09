@@ -278,8 +278,10 @@ function explainBotFailure(result, base = "/api/bot_connect") {
   }
   if (status === 404) {
     return "HTTP 404: " + base + " does not exist on this deployment. " +
-      "It is probably an old build or a static host — redeploy the current " +
-      "repository (api/bot_connect.py must be deployed) and retry.";
+      "The API is not being served there: an old build, a static host, or a " +
+      "Vercel project whose Framework Preset is Flask (that routes every /api/* " +
+      "request into api/index.py). Redeploy the current repository (vercel.json " +
+      "sets the Other preset, and api/bot_connect.py must be deployed) and retry.";
   }
   if (status >= 500) {
     return "HTTP " + status + " from " + base + " — the server function " +
